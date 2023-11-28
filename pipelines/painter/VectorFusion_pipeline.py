@@ -295,7 +295,7 @@ class VectorFusionPipeline(ModelState):
             self.args.path_svg = final_svg_fpth
             self.print("\nfine-tune SVG via Score Distillation Sampling...")
 
-        renderer = self.load_renderer(target_img, path_svg=final_svg_fpth)
+        renderer = self.load_renderer(target_img, path_svg=self.args.path_svg)
 
         if self.args.skip_live:
             renderer.component_wise_path_init(pred=None, init_type='random')
