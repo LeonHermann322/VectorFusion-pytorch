@@ -58,3 +58,4 @@ use_distance_weighted_loss: True
 xing_loss_weight: 0.01
 # pixel loss
 penalty_weight: 0.05
+sim_loss_weight: 1.0

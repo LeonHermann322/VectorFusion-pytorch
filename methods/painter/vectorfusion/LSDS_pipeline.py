@@ -42,21 +42,21 @@ class LSDSPipeline(StableDiffusionPipeline):
 
     @torch.no_grad()
     def __call__(
-            self,
-            prompt: Union[str, List[str]],
-            height: Optional[int] = None,
-            width: Optional[int] = None,
-            num_inference_steps: int = 50,
-            guidance_scale: float = 7.5,
-            negative_prompt: Optional[Union[str, List[str]]] = None,
-            num_images_per_prompt: Optional[int] = 1,
-            eta: float = 0.0,
-            generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-            latents: Optional[torch.FloatTensor] = None,
-            output_type: Optional[str] = "pil",
-            return_dict: bool = True,
-            callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-            callback_steps: Optional[int] = 1,
+        self,
+        prompt: Union[str, List[str]],
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: Optional[int] = 1,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -130,7 +130,11 @@ class LSDSPipeline(StableDiffusionPipeline):
 
         # 3. Encode input prompt
         text_embeddings = self._encode_prompt(
-            prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
+            prompt,
+            device,
+            num_images_per_prompt,
+            do_classifier_free_guidance,
+            negative_prompt,
         )
 
         # 4. Prepare timesteps
@@ -162,22 +166,34 @@ class LSDSPipeline(StableDiffusionPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                latent_model_input = (
+                    torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                )
+                latent_model_input = self.scheduler.scale_model_input(
+                    latent_model_input, t
+                )
 
                 # predict the noise residual
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+                noise_pred = self.unet(
+                    latent_model_input, t, encoder_hidden_states=text_embeddings
+                ).sample
 
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                    )
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                latents = self.scheduler.step(
+                    noise_pred, t, latents, **extra_step_kwargs
+                ).prev_sample
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
@@ -200,7 +216,9 @@ class LSDSPipeline(StableDiffusionPipeline):
         if not return_dict:
             return (image, has_nsfw_concept)
 
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        return StableDiffusionPipelineOutput(
+            images=image, nsfw_content_detected=has_nsfw_concept
+        )
 
     def encode_(self, images):
         images = (2 * images - 1).clamp(-1.0, 1.0)  # images: [B, 3, H, W]
@@ -215,21 +233,53 @@ class LSDSPipeline(StableDiffusionPipeline):
         return latents
 
     def x_augment(self, x: torch.Tensor, img_size: int = 512):
-        augment_compose = transforms.Compose([
-            transforms.RandomPerspective(distortion_scale=0.5, p=0.7),
-            transforms.RandomCrop(size=(img_size, img_size), pad_if_needed=True, padding_mode='reflect')
-        ])
+        augment_compose = transforms.Compose(
+            [
+                transforms.RandomPerspective(distortion_scale=0.5, p=0.7),
+                transforms.RandomCrop(
+                    size=(img_size, img_size),
+                    pad_if_needed=True,
+                    padding_mode="reflect",
+                ),
+            ]
+        )
         return augment_compose(x)
 
-    def score_distillation_sampling(self,
-                                    pred_rgb: torch.Tensor,
-                                    im_size: int,
-                                    prompt: Union[List, str],
-                                    negative_prompt: Union[List, str] = None,
-                                    guidance_scale: float = 100,
-                                    as_latent: bool = False,
-                                    grad_scale: float = 1,
-                                    t_range: Union[List[float], Tuple[float]] = (0.05, 0.95)):
+    def probabilistic_mse(
+        self, pred_rgb: torch.Tensor, target_rgb: torch.Tensor, log_var
+    ) -> torch.Tensor:
+        mse_loss = F.mse_loss(pred_rgb, target_rgb, reduction="none")
+        variance_loss = 0.5 * torch.exp(-log_var) * mse_loss + 0.5 * log_var
+        return variance_loss.mean()
+
+    def similarity_loss(
+        self,
+        pred_rgb: torch.Tensor,
+        orig_rgb: torch.Tensor,
+    ) -> torch.Tensor:
+        orig_rgb.requires_grad = False
+
+        # encode image into latents with vae, requires grad!
+        pred_latents = self.encode_(pred_rgb)
+
+        # Encode diffusion sample image
+        orig_latents = self.encode_(orig_rgb)
+
+        log_var = torch.log(torch.var(pred_latents))
+
+        return self.probabilistic_mse(pred_latents, orig_latents, log_var)
+
+    def score_distillation_sampling(
+        self,
+        pred_rgb: torch.Tensor,
+        im_size: int,
+        prompt: Union[List, str],
+        negative_prompt: Union[List, str] = None,
+        guidance_scale: float = 100,
+        as_latent: bool = False,
+        grad_scale: float = 1,
+        t_range: Union[List[float], Tuple[float]] = (0.05, 0.95),
+    ):
         num_train_timesteps = self.scheduler.config.num_train_timesteps
         min_step = int(num_train_timesteps * t_range[0])
         max_step = int(num_train_timesteps * t_range[1])
@@ -240,7 +290,13 @@ class LSDSPipeline(StableDiffusionPipeline):
 
         # the input is intercepted to im_size x im_size and then fed to the vae
         if as_latent:
-            latents = F.interpolate(pred_rgb_a, (64, 64), mode='bilinear', align_corners=False) * 2 - 1
+            latents = (
+                F.interpolate(
+                    pred_rgb_a, (64, 64), mode="bilinear", align_corners=False
+                )
+                * 2
+                - 1
+            )
         else:
             # encode image into latents with vae, requires grad!
             latents = self.encode_(pred_rgb_a)
@@ -249,13 +305,17 @@ class LSDSPipeline(StableDiffusionPipeline):
         num_images_per_prompt = 1  # the number of images to generate per prompt
         do_classifier_free_guidance = guidance_scale > 1.0
         text_embeddings = self._encode_prompt(
-            prompt, self.device, num_images_per_prompt,
+            prompt,
+            self.device,
+            num_images_per_prompt,
             do_classifier_free_guidance,
             negative_prompt=negative_prompt,
         )
 
         # timestep ~ U(0.05, 0.95) to avoid very high/low noise level
-        t = torch.randint(min_step, max_step + 1, [1], dtype=torch.long, device=self.device)
+        t = torch.randint(
+            min_step, max_step + 1, [1], dtype=torch.long, device=self.device
+        )
 
         # predict the noise residual with unet, stop gradient
         with torch.no_grad():
@@ -263,16 +323,24 @@ class LSDSPipeline(StableDiffusionPipeline):
             noise = torch.randn_like(latents)
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
             # pred noise
-            latent_model_input = torch.cat([latents_noisy] * 2) if do_classifier_free_guidance else latents_noisy
-            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
+            latent_model_input = (
+                torch.cat([latents_noisy] * 2)
+                if do_classifier_free_guidance
+                else latents_noisy
+            )
+            noise_pred = self.unet(
+                latent_model_input, t, encoder_hidden_states=text_embeddings
+            ).sample
 
         # perform guidance (high scale from paper!)
         if do_classifier_free_guidance:
             noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_pos - noise_pred_uncond)
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                noise_pred_pos - noise_pred_uncond
+            )
 
         # w(t), sigma_t^2
-        w = (1 - alphas[t])
+        w = 1 - alphas[t]
         grad = grad_scale * w * (noise_pred - noise)
         grad = torch.nan_to_num(grad)
 
@@ -283,7 +351,6 @@ class LSDSPipeline(StableDiffusionPipeline):
 
 
 class SpecifyGradient(torch.autograd.Function):
-
     @staticmethod
     @custom_fwd
     def forward(ctx, input_tensor, gt_grad):
@@ -294,6 +361,6 @@ class SpecifyGradient(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_scale):
-        gt_grad, = ctx.saved_tensors
+        (gt_grad,) = ctx.saved_tensors
         gt_grad = gt_grad * grad_scale
         return gt_grad, None
