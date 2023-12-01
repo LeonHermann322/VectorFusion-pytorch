@@ -12,6 +12,7 @@ import numpy as np
 from tqdm.auto import tqdm
 import torch
 from torchvision import transforms
+import wandb
 
 from libs.engine import ModelState
 from methods.painter.vectorfusion import LSDSPipeline, LSDSSDXLPipeline, Painter, PainterOptimizer
@@ -339,6 +340,8 @@ class VectorFusionPipeline(ModelState):
                     L_add = pixel_penalty_loss(raster_img) * self.args.penalty_weight
 
                 loss = L_sds + L_add
+
+                wandb.log({"loss": loss})
 
                 # optimization
                 optimizer.zero_grad_()
