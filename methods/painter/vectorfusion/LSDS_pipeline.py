@@ -3,10 +3,11 @@
 # Author: XiMing Xing
 # Description:
 
-from typing import Callable, List, Optional, Union, Tuple
+from typing import Callable, List, Literal, Optional, Union, Tuple
 
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.cuda.amp import custom_bwd, custom_fwd
 from torchvision import transforms
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
@@ -246,28 +247,83 @@ class LSDSPipeline(StableDiffusionPipeline):
         return augment_compose(x)
 
     def probabilistic_mse(
-        self, pred_rgb: torch.Tensor, target_rgb: torch.Tensor, log_var
+        self, pred_latents: torch.Tensor, target_latents: torch.Tensor, log_var
     ) -> torch.Tensor:
-        mse_loss = F.mse_loss(pred_rgb, target_rgb, reduction="none")
+        mse_loss = F.mse_loss(pred_latents, target_latents, reduction="none")
         variance_loss = 0.5 * torch.exp(-log_var) * mse_loss + 0.5 * log_var
         return variance_loss.mean()
+
+    def pmse_loss(
+        self,
+        pred_latents: torch.Tensor,
+        target_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        log_var = torch.log(torch.var(pred_latents))
+
+        return self.probabilistic_mse(pred_latents, target_latents, log_var)
+
+    def kl_div(
+        self, pred_latents: torch.Tensor, target_latents: torch.Tensor
+    ) -> torch.Tensor:
+        min = torch.min(pred_latents.min(), target_latents.min())
+
+        pred_latents = torch.log1p(torch.add(pred_latents, torch.abs(min)))
+        target_latents = torch.log1p(torch.add(target_latents, torch.abs(min)))
+
+        return F.kl_div(
+            pred_latents, target_latents, reduction="batchmean", log_target=True
+        )
+
+    def lpips_loss(
+        self,
+        pred_rgb: torch.Tensor,
+        target_rgb: torch.Tensor,
+    ) -> torch.Tensor:
+        pass
+
+    def clip_loss(
+        self,
+        pred_rgb: torch.Tensor,
+        target_rgb: torch.Tensor,
+    ) -> torch.Tensor:
+        pass
+
+    def jvsp_loss(
+        self,
+        pred_rgb: torch.Tensor,
+        target_rgb: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.lpips_loss() + self.clip_loss()
 
     def similarity_loss(
         self,
         pred_rgb: torch.Tensor,
-        orig_rgb: torch.Tensor,
+        target_rgb: torch.Tensor,
+        strategy: Literal["kl_div", "pmse", "mse", "jvsp"],
     ) -> torch.Tensor:
-        orig_rgb.requires_grad = False
+        target_rgb.requires_grad = False
 
         # encode image into latents with vae, requires grad!
         pred_latents = self.encode_(pred_rgb)
 
         # Encode diffusion sample image
-        orig_latents = self.encode_(orig_rgb)
+        target_latents = self.encode_(target_rgb)
 
-        log_var = torch.log(torch.var(pred_latents))
-
-        return self.probabilistic_mse(pred_latents, orig_latents, log_var)
+        if strategy == "kl_div":
+            return self.kl_div(pred_latents=pred_latents, target_latents=target_latents)
+        elif strategy == "pmse":
+            return self.pmse_loss(
+                pred_latents=pred_latents, target_latents=target_latents
+            )
+        elif strategy == "jvsp":
+            return self.jvsp_loss(
+                pred_latents=pred_latents,
+                target_latents=target_latents,
+                pred_rgb=pred_rgb,
+                target_rgb=target_rgb,
+            )
+        else:
+            return F.mse_loss(pred_latents, target_latents)
 
     def score_distillation_sampling(
         self,

@@ -3,6 +3,7 @@
 # Author: XiMing Xing
 # Description:
 
+from functools import partial
 from PIL import Image
 from typing import Union, AnyStr, List
 
@@ -12,6 +13,9 @@ import numpy as np
 from tqdm.auto import tqdm
 import torch
 from torchvision import transforms
+
+from DiffSketcher.libs.metric.lpips_origin.lpips import LPIPS
+from DiffSketcher.libs.metric.clip_score.openaiCLIP_loss import CLIPScoreWrapper
 
 from libs.engine import ModelState
 from methods.painter.vectorfusion import (
@@ -26,6 +30,7 @@ from methods.painter.vectorfusion import (
 from methods.painter.vectorfusion import xing_loss_fn
 from methods.painter.vectorfusion.utils import log_tensor_img, plt_batch, view_images
 from methods.diffusers_warp import init_diffusion_pipeline, model2res
+from diffusers import StableDiffusionPipeline
 from methods.diffvg_warp import init_diffvg
 
 
@@ -78,7 +83,7 @@ class VectorFusionPipeline(ModelState):
             custom_pipeline = LSDSPipeline
             custom_scheduler = diffusers.PNDMScheduler
 
-        self.diffusion = init_diffusion_pipeline(
+        self.diffusion: StableDiffusionPipeline = init_diffusion_pipeline(
             args.model_id,
             custom_pipeline=custom_pipeline,
             custom_scheduler=custom_scheduler,
@@ -92,6 +97,16 @@ class VectorFusionPipeline(ModelState):
             lora_path=args.lora_path,
         )
 
+        self.clip_score_fn = CLIPScoreWrapper(
+            self.args.clip.model_name,
+            device=self.device,
+            visual_score=True,
+            feats_loss_type=self.args.clip.feats_loss_type,
+            feats_loss_weights=self.args.clip.feats_loss_weights,
+            fc_loss_weight=self.args.clip.fc_loss_weight,
+        )
+        self.lpips_loss_fn = LPIPS(net=self.args.perceptual.lpips_net).to(self.device)
+
         self.g_device = torch.Generator(device=self.device).manual_seed(args.seed)
 
         if args.style == "pixelart":
@@ -101,6 +116,47 @@ class VectorFusionPipeline(ModelState):
         if args.train_stroke:
             args.path_reinit.use = False
             self.print("-> train stroke: True, then disable reinitialize_paths.")
+
+    # Taken from https://github.com/ximinng/DiffSketcher/blob/e4c03a6abd30dcb4b63ae5867f0bcc181ad0dccc/pipelines/painter/diffsketcher_pipeline.py
+    @property
+    def clip_norm_(self):
+        return transforms.Normalize(
+            (0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)
+        )
+
+    def clip_pair_augment(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        im_res: int,
+        augments: str = "affine_norm",
+        num_aug: int = 4,
+    ):
+        # init augmentations
+        augment_list = []
+        if "affine" in augments:
+            augment_list.append(
+                transforms.RandomPerspective(fill=0, p=1.0, distortion_scale=0.5)
+            )
+            augment_list.append(
+                transforms.RandomResizedCrop(im_res, scale=(0.8, 0.8), ratio=(1.0, 1.0))
+            )
+        augment_list.append(self.clip_norm_)  # CLIP Normalize
+
+        # compose augmentations
+        augment_compose = transforms.Compose(augment_list)
+        # make augmentation pairs
+        x_augs, y_augs = [self.clip_score_fn.normalize(x)], [
+            self.clip_score_fn.normalize(y)
+        ]
+        # repeat N times
+        for n in range(num_aug):
+            augmented_pair = augment_compose(torch.cat([x, y]))
+            x_augs.append(augmented_pair[0].unsqueeze(0))
+            y_augs.append(augmented_pair[1].unsqueeze(0))
+        xs = torch.cat(x_augs, dim=0)
+        ys = torch.cat(y_augs, dim=0)
+        return xs, ys
 
     def get_path_schedule(self, schedule_each: Union[int, List]):
         if self.args.path_schedule == "repeat":
@@ -400,13 +456,48 @@ class VectorFusionPipeline(ModelState):
                 if self.args.style == "pixelart":
                     L_add = pixel_penalty_loss(raster_img) * self.args.penalty_weight
 
-                # Similarity loss to diffusion sample
-                L_sim = (
-                    self.diffusion.similarity_loss(raster_img, target_img)
-                    * self.args.sim_loss_weight
-                )
+                # Taken from https://github.com/ximinng/DiffSketcher/blob/e4c03a6abd30dcb4b63ae5867f0bcc181ad0dccc/pipelines/painter/diffsketcher_pipeline.py
+                l_percep = torch.tensor(0.0)
+                total_visual_loss = torch.tensor(0.0)
+                if not self.args.skip_live:
+                    # Similarity loss to diffusion sample
+                    # L_sim = (
+                    #     # self.diffusion.similarity_loss(raster_img, target_img)
+                    #     self.diffusion.kl_div(raster_img, target_img)
+                    #     * self.args.sim_loss_weight
+                    # )
 
-                loss = L_sds + L_add + L_sim
+                    perceptual_loss_fn = partial(
+                        self.lpips_loss_fn.forward,
+                        return_per_layer=False,
+                        normalize=False,
+                    )
+                    l_perceptual = perceptual_loss_fn(raster_img, target_img).mean()
+                    l_percep = l_perceptual * self.args.perceptual.coeff
+
+                    # Taken from https://github.com/ximinng/DiffSketcher/blob/e4c03a6abd30dcb4b63ae5867f0bcc181ad0dccc/pipelines/painter/diffsketcher_pipeline.py
+                    # CLIP data augmentation
+                    raster_sketch_aug, inputs_aug = self.clip_pair_augment(
+                        raster_img,
+                        target_img,
+                        im_res=224,
+                        augments=self.args.clip.augmentations,
+                        num_aug=self.args.clip.num_aug,
+                    )
+
+                    if self.args.clip.vis_loss > 0:
+                        (
+                            l_clip_fc,
+                            l_clip_conv,
+                        ) = self.clip_score_fn.compute_visual_distance(
+                            raster_sketch_aug, inputs_aug, clip_norm=False
+                        )
+                        clip_conv_loss_sum = sum(l_clip_conv)
+                        total_visual_loss = self.args.clip.vis_loss * (
+                            clip_conv_loss_sum + l_clip_fc
+                        )
+
+                loss = L_sds + L_add + l_percep + total_visual_loss
 
                 # optimization
                 optimizer.zero_grad_()
@@ -439,7 +530,7 @@ class VectorFusionPipeline(ModelState):
 
                 pbar.set_description(
                     lr_str
-                    + f"L_total: {loss.item():.4f}, L_add: {L_add.item():.5e}, L_sim: {L_sim.item():.5e}, "
+                    + f"L_total: {loss.item():.4f}, L_add: {L_add.item():.5e}, L_percep: {l_percep.item():.5e}, Total vis loss: {total_visual_loss.item():.5e}, "
                     f"sds: {grad.item():.5e}"
                 )
 
