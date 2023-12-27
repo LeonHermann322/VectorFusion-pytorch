@@ -10,12 +10,12 @@ from typing import List, Dict
 
 from shapely.geometry.polygon import Polygon
 from omegaconf import DictConfig
-import cv2
 import numpy as np
 import pydiffvg
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import LambdaLR
+from methods.painter.vectorfusion.coord_inits import RandomCoordInit,NaiveCoordInit,SparseCoordInit, AttentionCoordInit
 
 
 class Painter(nn.Module):
@@ -34,6 +34,13 @@ class Painter(nn.Module):
             stroke_width: int = 3,
             path_svg=None,
             device=None,
+            attention_map =None,
+            softmax_temp = None,
+            num_stages = None,
+            num_paths = None,
+            xdog_intersec = None
+
+        
     ):
         super(Painter, self).__init__()
         self.device = device
@@ -72,7 +79,13 @@ class Painter(nn.Module):
         # Background color
         self.para_bg = torch.tensor([1., 1., 1.], requires_grad=trainable_bg, device=self.device)
 
+        #attention init
         self.pos_init_method = None
+        self.attention_map = attention_map
+        self.softmax_temp = softmax_temp
+        self.num_stages = num_stages
+        self.num_paths = num_paths
+        self.xdog_intersec = xdog_intersec
 
     def component_wise_path_init(self, pred, init_type: str = 'sparse'):
         assert self.target_img is not None  # gt
@@ -89,6 +102,18 @@ class Painter(nn.Module):
             if pred is None:
                 pred = self.para_bg.view(1, -1, 1, 1).repeat(1, 1, self.canvas_height, self.canvas_width)
             self.pos_init_method = NaiveCoordInit(pred, self.target_img)
+        elif init_type == 'attention':
+            self.pos_init_method = AttentionCoordInit(attention_map=self.attention_map, 
+                                                      softmax_temp=self.softmax_temp,
+                                                      canvas_height=self.canvas_height,
+                                                      canvas_width= self.canvas_width, 
+                                                      num_paths=self.num_paths, 
+                                                      num_stages=self.num_stages,
+                                                      image2clip_input = self.target_img,
+                                                      xdog_intersec = self.xdog_intersec)
+            
+        elif init_type == 'clipPasso':
+            raise NotImplementedError(f"'{init_type}' is not implemented.")
         else:
             raise NotImplementedError(f"'{init_type}' is not support.")
 
@@ -511,98 +536,6 @@ def get_sdf(phi, **kwargs):
     elif normalize == 'to1':
         sd /= sd.max()
     return sd
-
-
-class SparseCoordInit:
-
-    def __init__(self, pred, gt, format='[bs x c x 2D]', quantile_interval=200, nodiff_thres=0.1):
-        if torch.is_tensor(pred):
-            pred = pred.detach().cpu().numpy()
-        if torch.is_tensor(gt):
-            gt = gt.detach().cpu().numpy()
-
-        if format == '[bs x c x 2D]':
-            self.map = ((pred[0] - gt[0]) ** 2).sum(0)
-            self.reference_gt = copy.deepcopy(np.transpose(gt[0], (1, 2, 0)))
-        elif format == ['[2D x c]']:
-            self.map = (np.abs(pred - gt)).sum(-1)
-            self.reference_gt = copy.deepcopy(gt[0])
-        else:
-            raise ValueError
-
-        # OptionA: Zero too small errors to avoid the error too small deadloop
-        self.map[self.map < nodiff_thres] = 0
-        quantile_interval = np.linspace(0., 1., quantile_interval)
-        quantized_interval = np.quantile(self.map, quantile_interval)
-        # remove redundant
-        quantized_interval = np.unique(quantized_interval)
-        quantized_interval = sorted(quantized_interval[1:-1])
-        self.map = np.digitize(self.map, quantized_interval, right=False)
-        self.map = np.clip(self.map, 0, 255).astype(np.uint8)
-        self.idcnt = {}
-        for idi in sorted(np.unique(self.map)):
-            self.idcnt[idi] = (self.map == idi).sum()
-        # remove smallest one to remove the correct region
-        self.idcnt.pop(min(self.idcnt.keys()))
-
-    def __call__(self):
-        if len(self.idcnt) == 0:
-            h, w = self.map.shape
-            return [np.random.uniform(0, 1) * w, np.random.uniform(0, 1) * h]
-
-        target_id = max(self.idcnt, key=self.idcnt.get)
-        _, component, cstats, ccenter = cv2.connectedComponentsWithStats(
-            (self.map == target_id).astype(np.uint8),
-            connectivity=4
-        )
-        # remove cid = 0, it is the invalid area
-        csize = [ci[-1] for ci in cstats[1:]]
-        target_cid = csize.index(max(csize)) + 1
-        center = ccenter[target_cid][::-1]
-        coord = np.stack(np.where(component == target_cid)).T
-        dist = np.linalg.norm(coord - center, axis=1)
-        target_coord_id = np.argmin(dist)
-        coord_h, coord_w = coord[target_coord_id]
-
-        # replace_sampling
-        self.idcnt[target_id] -= max(csize)
-        if self.idcnt[target_id] == 0:
-            self.idcnt.pop(target_id)
-        self.map[component == target_cid] = 0
-        return [coord_w, coord_h]
-
-
-class RandomCoordInit:
-    def __init__(self, canvas_width, canvas_height):
-        self.canvas_width, self.canvas_height = canvas_width, canvas_height
-
-    def __call__(self):
-        w, h = self.canvas_width, self.canvas_height
-        return [np.random.uniform(0, 1) * w, np.random.uniform(0, 1) * h]
-
-
-class NaiveCoordInit:
-    def __init__(self, pred, gt, format='[bs x c x 2D]', replace_sampling=True):
-        if isinstance(pred, torch.Tensor):
-            pred = pred.detach().cpu().numpy()
-        if isinstance(gt, torch.Tensor):
-            gt = gt.detach().cpu().numpy()
-
-        if format == '[bs x c x 2D]':
-            self.map = ((pred[0] - gt[0]) ** 2).sum(0)
-        elif format == ['[2D x c]']:
-            self.map = ((pred - gt) ** 2).sum(-1)
-        else:
-            raise ValueError
-        self.replace_sampling = replace_sampling
-
-    def __call__(self):
-        coord = np.where(self.map == self.map.max())
-        coord_h, coord_w = coord[0][0], coord[1][0]
-        if self.replace_sampling:
-            self.map[coord_h, coord_w] = -1
-        return [coord_w, coord_h]
-
 
 class PainterOptimizer:
 
