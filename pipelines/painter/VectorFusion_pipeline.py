@@ -6,12 +6,16 @@
 from functools import partial
 from PIL import Image
 from typing import Union, AnyStr, List
+from skimage.color import rgb2gray
+
+from torchvision.datasets.folder import is_image_file
 
 from omegaconf.listconfig import ListConfig
 import diffusers
 import numpy as np
 from tqdm.auto import tqdm
 import torch
+import torch.nn.functional as F
 from torchvision import transforms
 
 from DiffSketcher.libs.metric.lpips_origin.lpips import LPIPS
@@ -32,6 +36,7 @@ from methods.painter.vectorfusion.utils import log_tensor_img, plt_batch, view_i
 from methods.diffusers_warp import init_diffusion_pipeline, model2res
 from diffusers import StableDiffusionPipeline
 from methods.diffvg_warp import init_diffvg
+from methods.token2attn.attn_control import AttentionStore, EmptyControl
 
 
 class VectorFusionPipeline(ModelState):
@@ -400,14 +405,26 @@ class VectorFusionPipeline(ModelState):
             target_img, final_svg_fpth = self.LIVE_rendering(text_prompt)
             torch.cuda.empty_cache()
             self.args.path_svg = final_svg_fpth
-            self.print("\nfine-tune SVG via Score Distillation Sampling...")
+            self.print("\nfine-tune SVG via Score Distillation Samplig...")
 
-        renderer = self.load_renderer(target_img, path_svg=final_svg_fpth)
+        attention_map = None
+        if self.args.coord_init == "attention":
+            target_img, attention_map = self.extract_ldm_attn(prompts=text_prompt)
+            target_img = self.get_target(target_img,
+                                       self.args.image_size)
+            target_img = target_img.detach()  # inputs as GT
+            self.print("inputs shape: ", target_img.shape)
+        
+        renderer = self.load_renderer(target_img, path_svg=self.args.path_svg, attention_map=attention_map)
 
         if self.args.skip_live:
-            renderer.component_wise_path_init(pred=None, init_type="random")
+            init_type = 'random'
+            if self.args.coord_init == "attention":
+                init_type = self.args.coord_init
+            renderer.component_wise_path_init(pred=None, init_type= init_type)
 
         img = renderer.init_image(stage=0, num_paths=self.args.num_paths)
+        
         log_tensor_img(img, self.results_path, output_prefix=f"init_img_stage_two")
 
         optimizer = PainterOptimizer(
@@ -556,19 +573,132 @@ class VectorFusionPipeline(ModelState):
 
         self.close(msg="painterly rendering complete.")
 
-    def load_renderer(self, target_img, path_svg=None):
-        renderer = Painter(
-            self.args.style,
-            target_img,
-            self.args.num_segments,
-            self.args.segment_init,
-            self.args.radius,
-            self.args.image_size,
-            self.args.grid,
-            self.args.trainable_bg,
-            self.args.train_stroke,
-            self.args.width,
-            path_svg=path_svg,
-            device=self.device,
-        )
+    def load_renderer(self, target_img, path_svg=None, attention_map=None):
+        renderer = Painter(self.args.style,
+                           target_img,
+                           self.args.num_segments,
+                           self.args.segment_init,
+                           self.args.radius,
+                           self.args.image_size,
+                           self.args.grid,
+                           self.args.trainable_bg,
+                           self.args.train_stroke,
+                           self.args.width,
+                           path_svg=path_svg,
+                            device=self.device,
+                            attention_map=attention_map,
+                            softmax_temp=self.args.softmax_temp, 
+                            num_paths=self.args.num_paths, 
+                            num_stages=self.args.num_stages,
+                            xdog_intersec=self.args.xdog_intersec)
         return renderer
+    
+    def extract_ldm_attn(self, prompts):
+        print("\n\nextract_ldm_attn\n\n")
+        # init controller
+        controller = AttentionStore() if self.args.attention_init else EmptyControl()
+
+        height = width = model2res(self.args.model_id)
+        outputs = self.diffusion(prompt=[prompts],
+                                 negative_prompt=self.args.negative_prompt,
+                                 height=height,
+                                 width=width,
+                                 controller=controller,
+                                 num_inference_steps=self.args.num_inference_steps,
+                                 guidance_scale=self.args.guidance_scale,
+                                 generator=self.g_device)
+
+        target_file = self.results_path / "ldm_generated_image.png"
+        view_images([np.array(img) for img in outputs.images], save_image=True, fp=target_file)
+
+        """ldm cross-attention map"""
+        cross_attention_maps, tokens = \
+            self.diffusion.get_cross_attention([prompts],
+                                               controller,
+                                               res=self.args.cross_attn_res,
+                                               from_where=("up", "down"),
+                                               save_path=self.results_path / "cross_attn.png")
+        self.print(f"the length of tokens is {len(tokens)}, select {self.args.token_ind}-th token")
+        # [res, res, seq_len]
+        self.print(f"origin cross_attn_map shape: {cross_attention_maps.shape}")
+        # [res, res]
+        cross_attn_map = cross_attention_maps[:, :, self.args.token_ind]
+        self.print(f"select cross_attn_map shape: {cross_attn_map.shape}\n")
+        cross_attn_map = 255 * cross_attn_map / cross_attn_map.max()
+        # [res, res, 3]
+        cross_attn_map = cross_attn_map.unsqueeze(-1).expand(*cross_attn_map.shape, 3)
+        # [3, res, res]
+        cross_attn_map = cross_attn_map.permute(2, 0, 1).unsqueeze(0)
+        # [3, clip_size, clip_size]
+        cross_attn_map = F.interpolate(cross_attn_map, size=self.args.image_size, mode='bicubic')
+        cross_attn_map = torch.clamp(cross_attn_map, min=0, max=255)
+        # rgb to gray
+        cross_attn_map = rgb2gray(cross_attn_map.squeeze(0).permute(1, 2, 0)).astype(np.float32)
+        # torch to numpy
+        if cross_attn_map.shape[-1] != self.args.image_size and cross_attn_map.shape[-2] != self.args.image_size:
+            cross_attn_map = cross_attn_map.reshape(self.args.image_size, self.args.image_size)
+        # to [0, 1]
+        cross_attn_map = (cross_attn_map - cross_attn_map.min()) / (cross_attn_map.max() - cross_attn_map.min())
+        """ldm self-attention map"""
+        self_attention_maps, svd, vh_ = \
+            self.diffusion.get_self_attention_comp([prompts],
+                                                   controller,
+                                                   res=self.args.self_attn_res,
+                                                   from_where=("up", "down"),
+                                                   img_size=self.args.image_size,
+                                                   max_com=self.args.max_com,
+                                                   save_path=self.results_path)
+        # comp self-attention map
+        if self.args.mean_comp:
+            self_attn = np.mean(vh_, axis=0)
+            self.print(f"use the mean of {self.args.max_com} comps.")
+        else:
+            self_attn = vh_[self.args.comp_idx]
+            self.print(f"select {self.args.comp_idx}-th comp.")
+        # to [0, 1]
+        self_attn = (self_attn - self_attn.min()) / (self_attn.max() - self_attn.min())
+        # visual final self-attention
+        self_attn_vis = np.copy(self_attn)
+        self_attn_vis = self_attn_vis * 255
+        self_attn_vis = np.repeat(np.expand_dims(self_attn_vis, axis=2), 3, axis=2).astype(np.uint8)
+        view_images(self_attn_vis, save_image=True, fp=self.results_path / "self-attn-final.png")
+        """attention map fusion"""
+        attn_map = self.args.attn_coeff * cross_attn_map + (1 - self.args.attn_coeff) * self_attn
+        # to [0, 1]
+        attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
+        self.print(f"-> fusion attn_map: {attn_map.shape}")
+        
+        return target_file, attn_map
+
+    def get_target(self,
+                   target_file,
+                   image_size):
+        if not is_image_file(str(target_file)):
+            raise TypeError(f"{target_file} is not image file.")
+
+        target = Image.open(target_file)
+
+        if target.mode == "RGBA":
+            # Create a white rgba background
+            new_image = Image.new("RGBA", target.size, "WHITE")
+            # Paste the image on the background.
+            new_image.paste(target, (0, 0), target)
+            target = new_image
+        target = target.convert("RGB")
+
+    
+
+        # define image transforms
+        transforms_ = []
+        if target.size[0] != target.size[1]:
+            transforms_.append(transforms.Resize((image_size, image_size)))
+        else:
+            transforms_.append(transforms.Resize(image_size))
+            transforms_.append(transforms.CenterCrop(image_size))
+        transforms_.append(transforms.ToTensor())
+
+        # preprocess
+        data_transforms = transforms.Compose(transforms_)
+        target_ = data_transforms(target).unsqueeze(0).to(self.device)
+
+        return target_

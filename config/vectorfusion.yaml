@@ -26,7 +26,7 @@ width: 3 # stroke width
 num_segments: 4
 segment_init: 'circle' # 'random'
 radius: 20
-coord_init: 'sparse' # 'random', 'naive', place the first control point
+coord_init: 'attention' # 'random', 'naive', place the first control point
 grid: 32 # divide the canvas into n grids
 path_reinit: # reinitializing paths
   use: True
@@ -58,6 +58,7 @@ use_distance_weighted_loss: True
 xing_loss_weight: 0.01
 # pixel loss
 penalty_weight: 0.05
+
 # JVSP
 clip:
   model_name: "RN101"  # RN101, ViT-L/14
@@ -73,3 +74,16 @@ perceptual:
   name: "lpips" # dists
   lpips_net: 'vgg'
   coeff: 0.2
+  
+token_ind: 1 # the index of CLIP prompt embedding, start from 1, 0 is start token
+attention_init: True # if True, use the attention heads of Dino model to set the location of the initial strokes
+xdog_intersec: True # initialize along the edge, mix XDoG and attn up
+softmax_temp: 0.5
+cross_attn_res: 16
+self_attn_res: 32
+max_com: 20 # select the number of the self-attn maps
+mean_comp: False # the average of the self-attn maps
+comp_idx: 0 # if mean_comp==False, indicates the index of the self-attn map
+attn_coeff: 1.0 # attn fusion, w * cross-attn + (1-w) * self-attn
+log_cross_attn: False # True if cross attn every step
+u2net_path: "./checkpoint/u2net/u2net.pth"
