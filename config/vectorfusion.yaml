@@ -59,8 +59,22 @@ xing_loss_weight: 0.01
 # pixel loss
 penalty_weight: 0.05
 
-#attention_init
-
+# JVSP
+clip:
+  model_name: "RN101"  # RN101, ViT-L/14
+  feats_loss_type: "l2" # clip visual loss type, conv layers
+  feats_loss_weights: [ 0,0,1.0,1.0,0 ] # RN based
+  #  feats_loss_weights: [ 0,0,1.0,1.0,0,0,0,0,0,0,0,0 ] # ViT based
+  fc_loss_weight: 0.1 # clip visual loss, fc layer weight
+  augmentations: "affine" # augmentation before clip visual computation
+  num_aug: 4 # num of augmentation before clip visual computation
+  vis_loss: 1 # 1 or 0 for use or disable clip visual loss
+  text_visual_coeff: 0 # cosine similarity between text and img
+perceptual:
+  name: "lpips" # dists
+  lpips_net: 'vgg'
+  coeff: 0.2
+  
 token_ind: 1 # the index of CLIP prompt embedding, start from 1, 0 is start token
 attention_init: True # if True, use the attention heads of Dino model to set the location of the initial strokes
 xdog_intersec: True # initialize along the edge, mix XDoG and attn up

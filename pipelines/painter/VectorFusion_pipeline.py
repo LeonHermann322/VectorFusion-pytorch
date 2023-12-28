@@ -2,6 +2,8 @@
 # Copyright (c) XiMing Xing. All rights reserved.
 # Author: XiMing Xing
 # Description:
+
+from functools import partial
 from PIL import Image
 from typing import Union, AnyStr, List
 from skimage.color import rgb2gray
@@ -16,27 +18,38 @@ import torch
 import torch.nn.functional as F
 from torchvision import transforms
 
+from DiffSketcher.libs.metric.lpips_origin.lpips import LPIPS
+from DiffSketcher.libs.metric.clip_score.openaiCLIP_loss import CLIPScoreWrapper
+
 from libs.engine import ModelState
-from methods.painter.vectorfusion import LSDSPipeline, LSDSSDXLPipeline, Painter, PainterOptimizer
-from methods.painter.vectorfusion import channel_saturation_penalty_loss as pixel_penalty_loss
+from methods.painter.vectorfusion import (
+    LSDSPipeline,
+    LSDSSDXLPipeline,
+    Painter,
+    PainterOptimizer,
+)
+from methods.painter.vectorfusion import (
+    channel_saturation_penalty_loss as pixel_penalty_loss,
+)
 from methods.painter.vectorfusion import xing_loss_fn
 from methods.painter.vectorfusion.utils import log_tensor_img, plt_batch, view_images
 from methods.diffusers_warp import init_diffusion_pipeline, model2res
+from diffusers import StableDiffusionPipeline
 from methods.diffvg_warp import init_diffvg
 from methods.token2attn.attn_control import AttentionStore, EmptyControl
 
 
 class VectorFusionPipeline(ModelState):
-
     def __init__(self, args):
-        logdir_ = f"{'scratch' if args.skip_live else 'baseline'}" \
-                  f"-{args.model_id}" \
-                  f"-{args.style}" \
-                  f"-sd{args.seed}" \
-                  f"-im{args.image_size}" \
-                  f"-P{args.num_paths}" \
-                  f"{'-RePath' if args.path_reinit.use else ''}"
-                  
+        logdir_ = (
+            f"{'scratch' if args.skip_live else 'baseline'}"
+            f"-{args.model_id}"
+            f"-{args.style}"
+            f"-sd{args.seed}"
+            f"-im{args.image_size}"
+            f"-P{args.num_paths}"
+            f"{'-RePath' if args.path_reinit.use else ''}"
+        )
         super().__init__(args, log_path_suffix=logdir_)
 
         assert args.style in ["iconography", "pixelart", "sketch"]
@@ -46,7 +59,7 @@ class VectorFusionPipeline(ModelState):
         self.svg_logs_dir = self.results_path / "svg_logs"
         self.ft_png_logs_dir = self.results_path / "ft_png_logs"
         self.ft_svg_logs_dir = self.results_path / "ft_svg_logs"
-        self.sd_sample_dir = self.results_path / 'sd_samples'
+        self.sd_sample_dir = self.results_path / "sd_samples"
         self.reinit_dir = self.results_path / "reinit_logs"
 
         if self.accelerator.is_main_process:
@@ -57,7 +70,7 @@ class VectorFusionPipeline(ModelState):
             self.sd_sample_dir.mkdir(parents=True, exist_ok=True)
             self.reinit_dir.mkdir(parents=True, exist_ok=True)
 
-        self.select_fpth = self.results_path / 'select_sample.png'
+        self.select_fpth = self.results_path / "select_sample.png"
 
         init_diffvg(self.device, True, args.print_timing)
 
@@ -68,14 +81,14 @@ class VectorFusionPipeline(ModelState):
             # because the random t may not in scheduler.timesteps
             custom_pipeline = LSDSSDXLPipeline
             custom_scheduler = diffusers.DPMSolverMultistepScheduler
-        elif args.model_id == 'sd21':
+        elif args.model_id == "sd21":
             custom_pipeline = LSDSPipeline
             custom_scheduler = diffusers.DDIMScheduler
         else:  # sd14, sd15
             custom_pipeline = LSDSPipeline
             custom_scheduler = diffusers.PNDMScheduler
 
-        self.diffusion = init_diffusion_pipeline(
+        self.diffusion: StableDiffusionPipeline = init_diffusion_pipeline(
             args.model_id,
             custom_pipeline=custom_pipeline,
             custom_scheduler=custom_scheduler,
@@ -86,34 +99,89 @@ class VectorFusionPipeline(ModelState):
             ldm_speed_up=args.ldm_speed_up,
             enable_xformers=args.enable_xformers,
             gradient_checkpoint=args.gradient_checkpoint,
-            lora_path=args.lora_path
+            lora_path=args.lora_path,
         )
+
+        self.clip_score_fn = CLIPScoreWrapper(
+            self.args.clip.model_name,
+            device=self.device,
+            visual_score=True,
+            feats_loss_type=self.args.clip.feats_loss_type,
+            feats_loss_weights=self.args.clip.feats_loss_weights,
+            fc_loss_weight=self.args.clip.fc_loss_weight,
+        )
+        self.lpips_loss_fn = LPIPS(net=self.args.perceptual.lpips_net).to(self.device)
 
         self.g_device = torch.Generator(device=self.device).manual_seed(args.seed)
 
         if args.style == "pixelart":
-            args.path_schedule = 'list'
+            args.path_schedule = "list"
             args.schedule_each = list([args.grid])
 
         if args.train_stroke:
             args.path_reinit.use = False
             self.print("-> train stroke: True, then disable reinitialize_paths.")
 
+    # Taken from https://github.com/ximinng/DiffSketcher/blob/e4c03a6abd30dcb4b63ae5867f0bcc181ad0dccc/pipelines/painter/diffsketcher_pipeline.py
+    @property
+    def clip_norm_(self):
+        return transforms.Normalize(
+            (0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)
+        )
+
+    def clip_pair_augment(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        im_res: int,
+        augments: str = "affine_norm",
+        num_aug: int = 4,
+    ):
+        # init augmentations
+        augment_list = []
+        if "affine" in augments:
+            augment_list.append(
+                transforms.RandomPerspective(fill=0, p=1.0, distortion_scale=0.5)
+            )
+            augment_list.append(
+                transforms.RandomResizedCrop(im_res, scale=(0.8, 0.8), ratio=(1.0, 1.0))
+            )
+        augment_list.append(self.clip_norm_)  # CLIP Normalize
+
+        # compose augmentations
+        augment_compose = transforms.Compose(augment_list)
+        # make augmentation pairs
+        x_augs, y_augs = [self.clip_score_fn.normalize(x)], [
+            self.clip_score_fn.normalize(y)
+        ]
+        # repeat N times
+        for n in range(num_aug):
+            augmented_pair = augment_compose(torch.cat([x, y]))
+            x_augs.append(augmented_pair[0].unsqueeze(0))
+            y_augs.append(augmented_pair[1].unsqueeze(0))
+        xs = torch.cat(x_augs, dim=0)
+        ys = torch.cat(y_augs, dim=0)
+        return xs, ys
+
     def get_path_schedule(self, schedule_each: Union[int, List]):
-        if self.args.path_schedule == 'repeat':
+        if self.args.path_schedule == "repeat":
             return int(self.args.num_paths / schedule_each) * [schedule_each]
-        elif self.args.path_schedule == 'list':
-            assert isinstance(self.args.schedule_each, list) or isinstance(self.args.schedule_each, ListConfig)
+        elif self.args.path_schedule == "list":
+            assert isinstance(self.args.schedule_each, list) or isinstance(
+                self.args.schedule_each, ListConfig
+            )
             return schedule_each
         else:
             raise NotImplementedError
 
     def target_file_preprocess(self, tar_path: AnyStr):
-        process_comp = transforms.Compose([
-            transforms.Resize(size=(self.args.image_size, self.args.image_size)),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda t: t.unsqueeze(0)),
-        ])
+        process_comp = transforms.Compose(
+            [
+                transforms.Resize(size=(self.args.image_size, self.args.image_size)),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda t: t.unsqueeze(0)),
+            ]
+        )
 
         tar_pil = Image.open(tar_path).convert("RGB")  # open file
         target_img = process_comp(tar_pil)  # preprocess
@@ -121,7 +189,9 @@ class VectorFusionPipeline(ModelState):
         return target_img
 
     @torch.no_grad()
-    def rejection_sampling(self, img_caption: Union[AnyStr, List], diffusion_samples: List):
+    def rejection_sampling(
+        self, img_caption: Union[AnyStr, List], diffusion_samples: List
+    ):
         import clip  # local import
 
         clip_model, preprocess = clip.load("ViT-B/32", device=self.device)
@@ -130,8 +200,8 @@ class VectorFusionPipeline(ModelState):
         text_features = clip_model.encode_text(text_input)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        clip_images = torch.stack([
-            preprocess(sample) for sample in diffusion_samples]
+        clip_images = torch.stack(
+            [preprocess(sample) for sample in diffusion_samples]
         ).to(self.device)
         image_features = clip_model.encode_image(clip_images)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -148,19 +218,25 @@ class VectorFusionPipeline(ModelState):
         diffusion_samples = []
         for i in range(self.args.K):
             height = width = model2res(self.args.model_id)
-            outputs = self.diffusion(prompt=[text_prompt],
-                                     negative_prompt=self.args.negative_prompt,
-                                     height=height,
-                                     width=width,
-                                     num_images_per_prompt=1,
-                                     num_inference_steps=self.args.num_inference_steps,
-                                     guidance_scale=self.args.guidance_scale,
-                                     generator=self.g_device)
+            outputs = self.diffusion(
+                prompt=[text_prompt],
+                negative_prompt=self.args.negative_prompt,
+                height=height,
+                width=width,
+                num_images_per_prompt=1,
+                num_inference_steps=self.args.num_inference_steps,
+                guidance_scale=self.args.guidance_scale,
+                generator=self.g_device,
+            )
             outputs_np = [np.array(img) for img in outputs.images]
-            view_images(outputs_np, save_image=True, fp=self.sd_sample_dir / f'samples_{i}.png')
+            view_images(
+                outputs_np, save_image=True, fp=self.sd_sample_dir / f"samples_{i}.png"
+            )
             diffusion_samples.extend(outputs.images)
 
-        self.print(f"num_generated_samples: {len(diffusion_samples)}, shape: {outputs_np[0].shape}")
+        self.print(
+            f"num_generated_samples: {len(diffusion_samples)}, shape: {outputs_np[0].shape}"
+        )
 
         return diffusion_samples
 
@@ -190,8 +266,14 @@ class VectorFusionPipeline(ModelState):
         renderer.component_wise_path_init(pred=None, init_type=self.args.coord_init)
 
         optimizer_list = [
-            PainterOptimizer(renderer, self.args.style, self.args.num_iter, self.args.lr_base,
-                             self.args.train_stroke, self.args.trainable_bg)
+            PainterOptimizer(
+                renderer,
+                self.args.style,
+                self.args.num_iter,
+                self.args.lr_base,
+                self.args.train_stroke,
+                self.args.trainable_bg,
+            )
             for _ in range(len(path_schedule))
         ]
 
@@ -199,37 +281,52 @@ class VectorFusionPipeline(ModelState):
         loss_weight_keep = 0
 
         total_step = len(path_schedule) * self.args.num_iter
-        with tqdm(initial=self.step, total=total_step, disable=not self.accelerator.is_main_process) as pbar:
+        with tqdm(
+            initial=self.step,
+            total=total_step,
+            disable=not self.accelerator.is_main_process,
+        ) as pbar:
             for path_idx, pathn in enumerate(path_schedule):
                 # record path
                 pathn_record.append(pathn)
                 # init graphic
                 img = renderer.init_image(stage=0, num_paths=pathn)
-                log_tensor_img(img, self.results_path, output_prefix=f"init_img_{path_idx}")
+                log_tensor_img(
+                    img, self.results_path, output_prefix=f"init_img_{path_idx}"
+                )
                 # rebuild optimizer
-                optimizer_list[path_idx].init_optimizers(pid_delta=int(path_idx * pathn))
+                optimizer_list[path_idx].init_optimizers(
+                    pid_delta=int(path_idx * pathn)
+                )
 
-                pbar.write(f"=> adding {pathn} paths, n_path: {sum(pathn_record)}, "
-                           f"n_points: {len(renderer.get_point_parameters())}, "
-                           f"n_colors: {len(renderer.get_color_parameters())}")
+                pbar.write(
+                    f"=> adding {pathn} paths, n_path: {sum(pathn_record)}, "
+                    f"n_points: {len(renderer.get_point_parameters())}, "
+                    f"n_colors: {len(renderer.get_color_parameters())}"
+                )
 
                 for t in range(self.args.num_iter):
                     raster_img = renderer.get_image(step=t).to(self.device)
 
-                    if self.args.use_distance_weighted_loss and not (self.args.style == "pixelart"):
+                    if self.args.use_distance_weighted_loss and not (
+                        self.args.style == "pixelart"
+                    ):
                         loss_weight = renderer.calc_distance_weight(loss_weight_keep)
 
                     # reconstruction loss
                     if self.args.style == "pixelart":
                         loss_recon = torch.nn.functional.l1_loss(raster_img, target_img)
                     else:  # UDF loss
-                        loss_recon = ((raster_img - target_img) ** 2)
+                        loss_recon = (raster_img - target_img) ** 2
                         loss_recon = (loss_recon.sum(1) * loss_weight).mean()
 
                     # Xing Loss for Self-Interaction Problem
-                    loss_xing = torch.tensor(0.)
+                    loss_xing = torch.tensor(0.0)
                     if self.args.style == "iconography":
-                        loss_xing = xing_loss_fn(renderer.get_point_parameters()) * self.args.xing_loss_weight
+                        loss_xing = (
+                            xing_loss_fn(renderer.get_point_parameters())
+                            * self.args.xing_loss_weight
+                        )
 
                     # total loss
                     loss = loss_recon + loss_xing
@@ -239,8 +336,7 @@ class VectorFusionPipeline(ModelState):
                         lr_str += f"{k}_lr: {lr:.4f}, "
 
                     pbar.set_description(
-                        lr_str +
-                        f"L_total: {loss.item():.4f}, "
+                        lr_str + f"L_total: {loss.item():.4f}, "
                         f"L_recon: {loss_recon.item():.4f}, "
                         f"L_xing: {loss_xing.item()}"
                     )
@@ -260,20 +356,29 @@ class VectorFusionPipeline(ModelState):
                         for i in range(path_idx + 1):
                             optimizer_list[i].update_lr()
 
-                    if self.step % self.args.save_step == 0 and self.accelerator.is_main_process:
-                        plt_batch(target_img,
-                                  raster_img,
-                                  self.step,
-                                  prompt=text_prompt,
-                                  save_path=self.png_logs_dir.as_posix(),
-                                  name=f"iter{self.step}")
-                        renderer.save_svg(self.svg_logs_dir / f"svg_iter{self.step}.svg")
+                    if (
+                        self.step % self.args.save_step == 0
+                        and self.accelerator.is_main_process
+                    ):
+                        plt_batch(
+                            target_img,
+                            raster_img,
+                            self.step,
+                            prompt=text_prompt,
+                            save_path=self.png_logs_dir.as_posix(),
+                            name=f"iter{self.step}",
+                        )
+                        renderer.save_svg(
+                            self.svg_logs_dir / f"svg_iter{self.step}.svg"
+                        )
 
                     self.step += 1
                     pbar.update(1)
 
                 # end a set of path optimization
-                if self.args.use_distance_weighted_loss and not (self.args.style == "pixelart"):
+                if self.args.use_distance_weighted_loss and not (
+                    self.args.style == "pixelart"
+                ):
                     loss_weight_keep = loss_weight.detach().cpu().numpy() * 1
                 # recalculate the coordinates for the new join path
                 renderer.component_wise_path_init(raster_img)
@@ -290,7 +395,9 @@ class VectorFusionPipeline(ModelState):
         self.print(f"negative_prompt: {self.args.negative_prompt}\n")
 
         if self.args.skip_live:
-            target_img = torch.zeros(self.args.batch_size, 3, self.args.image_size, self.args.image_size)
+            target_img = torch.zeros(
+                self.args.batch_size, 3, self.args.image_size, self.args.image_size
+            )
             final_svg_fpth = None
             self.print("from scratch with Score Distillation Sampling...")
         else:
@@ -320,10 +427,14 @@ class VectorFusionPipeline(ModelState):
         
         log_tensor_img(img, self.results_path, output_prefix=f"init_img_stage_two")
 
-        optimizer = PainterOptimizer(renderer, self.args.style, self.args.sds.num_iter,
-                                     self.args.lr_base,
-                                     self.args.train_stroke,
-                                     self.args.trainable_bg)
+        optimizer = PainterOptimizer(
+            renderer,
+            self.args.style,
+            self.args.sds.num_iter,
+            self.args.lr_base,
+            self.args.train_stroke,
+            self.args.trainable_bg,
+        )
         optimizer.init_optimizers()
 
         self.print(f"-> Painter points Params: {len(renderer.get_point_parameters())}")
@@ -334,7 +445,11 @@ class VectorFusionPipeline(ModelState):
         path_reinit = self.args.path_reinit
 
         self.print(f"\ntotal sds optimization steps: {total_step}")
-        with tqdm(initial=self.step, total=total_step, disable=not self.accelerator.is_main_process) as pbar:
+        with tqdm(
+            initial=self.step,
+            total=total_step,
+            disable=not self.accelerator.is_main_process,
+        ) as pbar:
             while self.step < total_step:
                 raster_img = renderer.get_image(step=self.step).to(self.device)
 
@@ -348,14 +463,58 @@ class VectorFusionPipeline(ModelState):
                     t_range=list(self.args.sds.t_range),
                 )
                 # Xing Loss for Self-Interaction Problem
-                L_add = torch.tensor(0.)
+                L_add = torch.tensor(0.0)
                 if self.args.style == "iconography":
-                    L_add = xing_loss_fn(renderer.get_point_parameters()) * self.args.xing_loss_weight
+                    L_add = (
+                        xing_loss_fn(renderer.get_point_parameters())
+                        * self.args.xing_loss_weight
+                    )
                 # pixel_penalty_loss to combat oversaturation
                 if self.args.style == "pixelart":
                     L_add = pixel_penalty_loss(raster_img) * self.args.penalty_weight
 
-                loss = L_sds + L_add
+                # Taken from https://github.com/ximinng/DiffSketcher/blob/e4c03a6abd30dcb4b63ae5867f0bcc181ad0dccc/pipelines/painter/diffsketcher_pipeline.py
+                l_percep = torch.tensor(0.0)
+                total_visual_loss = torch.tensor(0.0)
+                if not self.args.skip_live:
+                    # Similarity loss to diffusion sample
+                    # L_sim = (
+                    #     # self.diffusion.similarity_loss(raster_img, target_img)
+                    #     self.diffusion.kl_div(raster_img, target_img)
+                    #     * self.args.sim_loss_weight
+                    # )
+
+                    perceptual_loss_fn = partial(
+                        self.lpips_loss_fn.forward,
+                        return_per_layer=False,
+                        normalize=False,
+                    )
+                    l_perceptual = perceptual_loss_fn(raster_img, target_img).mean()
+                    l_percep = l_perceptual * self.args.perceptual.coeff
+
+                    # Taken from https://github.com/ximinng/DiffSketcher/blob/e4c03a6abd30dcb4b63ae5867f0bcc181ad0dccc/pipelines/painter/diffsketcher_pipeline.py
+                    # CLIP data augmentation
+                    raster_sketch_aug, inputs_aug = self.clip_pair_augment(
+                        raster_img,
+                        target_img,
+                        im_res=224,
+                        augments=self.args.clip.augmentations,
+                        num_aug=self.args.clip.num_aug,
+                    )
+
+                    if self.args.clip.vis_loss > 0:
+                        (
+                            l_clip_fc,
+                            l_clip_conv,
+                        ) = self.clip_score_fn.compute_visual_distance(
+                            raster_sketch_aug, inputs_aug, clip_norm=False
+                        )
+                        clip_conv_loss_sum = sum(l_clip_conv)
+                        total_visual_loss = self.args.clip.vis_loss * (
+                            clip_conv_loss_sum + l_clip_fc
+                        )
+
+                loss = L_sds + L_add + l_percep + total_visual_loss
 
                 # optimization
                 optimizer.zero_grad_()
@@ -366,11 +525,17 @@ class VectorFusionPipeline(ModelState):
                     renderer.clip_curve_shape()
 
                 # re-init paths
-                if self.step % path_reinit.freq == 0 and self.step < path_reinit.stop_step and self.step != 0:
-                    renderer.reinitialize_paths(path_reinit.use,  # on-off
-                                                path_reinit.opacity_threshold,
-                                                path_reinit.area_threshold,
-                                                fpath=self.reinit_dir / f"reinit-{self.step}.svg")
+                if (
+                    self.step % path_reinit.freq == 0
+                    and self.step < path_reinit.stop_step
+                    and self.step != 0
+                ):
+                    renderer.reinitialize_paths(
+                        path_reinit.use,  # on-off
+                        path_reinit.opacity_threshold,
+                        path_reinit.area_threshold,
+                        fpath=self.reinit_dir / f"reinit-{self.step}.svg",
+                    )
 
                 # update lr
                 if self.args.lr_scheduler:
@@ -381,18 +546,23 @@ class VectorFusionPipeline(ModelState):
                     lr_str += f"{k}_lr: {lr:.4f}, "
 
                 pbar.set_description(
-                    lr_str +
-                    f"L_total: {loss.item():.4f}, L_add: {L_add.item():.5e}, "
+                    lr_str
+                    + f"L_total: {loss.item():.4f}, L_add: {L_add.item():.5e}, L_percep: {l_percep.item():.5e}, Total vis loss: {total_visual_loss.item():.5e}, "
                     f"sds: {grad.item():.5e}"
                 )
 
-                if self.step % self.args.save_step == 0 and self.accelerator.is_main_process:
-                    plt_batch(target_img,
-                              raster_img,
-                              self.step,
-                              prompt=text_prompt,
-                              save_path=self.ft_png_logs_dir.as_posix(),
-                              name=f"iter{self.step}")
+                if (
+                    self.step % self.args.save_step == 0
+                    and self.accelerator.is_main_process
+                ):
+                    plt_batch(
+                        target_img,
+                        raster_img,
+                        self.step,
+                        prompt=text_prompt,
+                        save_path=self.ft_png_logs_dir.as_posix(),
+                        name=f"iter{self.step}",
+                    )
                     renderer.save_svg(self.ft_svg_logs_dir / f"svg_iter{self.step}.svg")
 
                 self.step += 1
