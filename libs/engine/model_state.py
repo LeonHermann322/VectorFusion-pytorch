@@ -3,6 +3,7 @@
 # Author: XiMing Xing
 # Description:
 import gc
+import os
 from functools import partial
 from typing import Union, List
 from pathlib import Path
@@ -150,7 +151,9 @@ class ModelState:
             if args.use_wandb:
                 print(f"-> Init trackers: 'wandb' ")
                 self.args.visual = True
-                self.__init_tracker(project_name="my_project", tags=None, entity="")
+                project_name = os.environ.get("WANDB_PROJECT")
+                print(f"Wandb project name: {project_name}")
+                self.__init_tracker(project_name=project_name, tags=None, entity="")
 
             print(f"-> Working Space: '{self.results_path}'")
 

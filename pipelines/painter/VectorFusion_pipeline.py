@@ -17,6 +17,7 @@ from tqdm.auto import tqdm
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
+import wandb
 
 from DiffSketcher.libs.metric.lpips_origin.lpips import LPIPS
 from DiffSketcher.libs.metric.clip_score.openaiCLIP_loss import CLIPScoreWrapper
@@ -51,6 +52,8 @@ class VectorFusionPipeline(ModelState):
             f"{'-RePath' if args.path_reinit.use else ''}"
         )
         super().__init__(args, log_path_suffix=logdir_)
+
+        wandb.init()
 
         assert args.style in ["iconography", "pixelart", "sketch"]
 
@@ -515,6 +518,17 @@ class VectorFusionPipeline(ModelState):
                         )
 
                 loss = L_sds + L_add + l_percep + total_visual_loss
+
+                # print(f"SDS Loss: {loss} at step {self.step}")
+                # wandb.log({"loss": loss})
+
+                wandb.log(
+                    {
+                        "L_total": loss.item(), 
+                        "L_sds": L_sds.item(), 
+                        "L_add": L_add.item(),
+                    }
+                )
 
                 # optimization
                 optimizer.zero_grad_()
