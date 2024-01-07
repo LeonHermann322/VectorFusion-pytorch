@@ -38,7 +38,7 @@ from methods.painter.vectorfusion.utils import log_tensor_img, plt_batch, view_i
 from methods.diffusers_warp import init_diffusion_pipeline, model2res
 from diffusers import StableDiffusionPipeline
 from methods.diffvg_warp import init_diffvg
-from methods.token2attn.attn_control import AttentionStore, EmptyControl
+from DiffSketcher.methods.token2attn.attn_control import AttentionStore, EmptyControl
 
 
 class VectorFusionPipeline(ModelState):
@@ -221,7 +221,7 @@ class VectorFusionPipeline(ModelState):
 
         selected_image_index = similarity_scores.argmax().item()
         selected_image = diffusion_samples[selected_image_index]
-        return selected_image
+        return selected_image, selected_image_index
 
     def diffusion_sampling(self, text_prompt: AnyStr):
         """sampling K images"""
@@ -250,30 +250,13 @@ class VectorFusionPipeline(ModelState):
 
         return diffusion_samples
     
-    def get_diffusion_sample(self, text_prompt: AnyStr):
-        select_fpth = self.select_fpth
-        # sampling K images
-        diffusion_samples = self.diffusion_sampling(text_prompt)
-        # rejection sampling
-        select_target = self.rejection_sampling(text_prompt, diffusion_samples)
-        select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
-        select_target_pil.save(select_fpth)
-
-        # empty cache
-        torch.cuda.empty_cache()
-
-        # load target file
-        assert select_fpth.exists(), f"{select_fpth} is not exist!"
-        target_img = self.target_file_preprocess(select_fpth.as_posix())
-        
-        return target_img
 
     def LIVE_rendering(self, text_prompt: AnyStr):
         select_fpth = self.select_fpth
         # sampling K images
         diffusion_samples = self.diffusion_sampling(text_prompt)
         # rejection sampling
-        select_target = self.rejection_sampling(text_prompt, diffusion_samples)
+        select_target, _ = self.rejection_sampling(text_prompt, diffusion_samples)
         select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
         select_target_pil.save(select_fpth)
 
@@ -428,12 +411,12 @@ class VectorFusionPipeline(ModelState):
             target_img = torch.zeros(
                 self.args.batch_size, 3, self.args.image_size, self.args.image_size
             )
-            if self.args.use_jvsp:
-                target_img = self.get_diffusion_sample(text_prompt)
             final_svg_fpth = None
             self.print("from scratch with Score Distillation Sampling...")
         else:
             # text-to-img-to-svg
+            if self.args.coord_init == "attention":
+                raise("Attention Init does not work with live,")
             target_img, final_svg_fpth = self.LIVE_rendering(text_prompt)
             torch.cuda.empty_cache()
             self.args.path_svg = final_svg_fpth
@@ -639,30 +622,88 @@ class VectorFusionPipeline(ModelState):
         return renderer
     
     def extract_ldm_attn(self, prompts):
-        print("\n\nextract_ldm_attn\n\n")
+        print("\n\nextract_ldm_attn with k sampling\n\n")
         # init controller
         controller = AttentionStore() if self.args.attention_init else EmptyControl()
+        
+        cross_attention_outputs = []
+        self_attention_comp_outputs = []
+        
+        select_fpth = self.select_fpth
 
-        height = width = model2res(self.args.model_id)
-        outputs = self.diffusion(prompt=[prompts],
-                                 negative_prompt=self.args.negative_prompt,
-                                 height=height,
-                                 width=width,
-                                 controller=controller,
-                                 num_inference_steps=self.args.num_inference_steps,
-                                 guidance_scale=self.args.guidance_scale,
-                                 generator=self.g_device)
-
-        target_file = self.results_path / "ldm_generated_image.png"
-        view_images([np.array(img) for img in outputs.images], save_image=True, fp=target_file)
-
-        """ldm cross-attention map"""
-        cross_attention_maps, tokens = \
+        # sampling K images
+        diffusion_samples = []
+        for i in range(self.args.K):
+            height = width = model2res(self.args.model_id)
+            outputs = self.diffusion(
+                prompt=[prompts],
+                negative_prompt=self.args.negative_prompt,
+                height=height,
+                width=width,
+                num_images_per_prompt=1,
+                num_inference_steps=self.args.num_inference_steps,
+                guidance_scale=self.args.guidance_scale,
+                generator=self.g_device,
+                controller=controller,
+            )
+            outputs_np = [np.array(img) for img in outputs.images]
+            view_images(
+                outputs_np, save_image=True, fp=self.sd_sample_dir / f"samples_{i}.png"
+            )
+            
+            """ldm cross-attention map"""
+            cross_attention_maps, tokens = \
             self.diffusion.get_cross_attention([prompts],
                                                controller,
                                                res=self.args.cross_attn_res,
                                                from_where=("up", "down"),
-                                               save_path=self.results_path / "cross_attn.png")
+                                               save_path=self.results_path / f"cross_attn{i}.png")
+            
+            """ldm self-attention map"""
+            self_attention_maps, svd, vh_ = \
+            self.diffusion.get_self_attention_comp([prompts],
+                                                   controller,
+                                                   res=self.args.self_attn_res,
+                                                   from_where=("up", "down"),
+                                                   img_size=self.args.image_size,
+                                                   max_com=self.args.max_com,
+                                                   save_path=self.results_path, 
+                                                   index=i)
+            
+            cross_attention_outputs.append((cross_attention_maps, tokens))
+            self_attention_comp_outputs.append((self_attention_maps, svd, vh_))
+            
+            diffusion_samples.extend(outputs.images)
+            controller.reset()
+
+        self.print(
+            f"num_generated_samples: {len(diffusion_samples)}, shape: {outputs_np[0].shape}"
+        )
+        # rejection sampling
+        select_target, target_index = self.rejection_sampling(prompts, diffusion_samples)
+        # empty cache
+        torch.cuda.empty_cache()
+
+        
+        select_fpth = self.select_fpth
+        select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
+        select_target_pil.save(select_fpth)
+        
+        # load target file
+        assert select_fpth.exists(), f"{select_fpth} is not exist!"
+        target_img = self.target_file_preprocess(select_fpth.as_posix())
+        
+
+        target_path = self.results_path / "ldm_generated_image.png"
+        view_images([np.array(select_target)], save_image=True, fp=target_path)
+
+        
+        
+        '''Attention Map calculating'''
+        self_attention_maps, svd, vh_  = self_attention_comp_outputs[target_index] 
+        cross_attention_maps, tokens = cross_attention_outputs[target_index]
+        
+        
         self.print(f"the length of tokens is {len(tokens)}, select {self.args.token_ind}-th token")
         # [res, res, seq_len]
         self.print(f"origin cross_attn_map shape: {cross_attention_maps.shape}")
@@ -684,15 +725,7 @@ class VectorFusionPipeline(ModelState):
             cross_attn_map = cross_attn_map.reshape(self.args.image_size, self.args.image_size)
         # to [0, 1]
         cross_attn_map = (cross_attn_map - cross_attn_map.min()) / (cross_attn_map.max() - cross_attn_map.min())
-        """ldm self-attention map"""
-        self_attention_maps, svd, vh_ = \
-            self.diffusion.get_self_attention_comp([prompts],
-                                                   controller,
-                                                   res=self.args.self_attn_res,
-                                                   from_where=("up", "down"),
-                                                   img_size=self.args.image_size,
-                                                   max_com=self.args.max_com,
-                                                   save_path=self.results_path)
+        
         # comp self-attention map
         if self.args.mean_comp:
             self_attn = np.mean(vh_, axis=0)
@@ -713,7 +746,7 @@ class VectorFusionPipeline(ModelState):
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
         self.print(f"-> fusion attn_map: {attn_map.shape}")
         
-        return target_file, attn_map
+        return target_path, attn_map
 
     def get_target(self,
                    target_file,

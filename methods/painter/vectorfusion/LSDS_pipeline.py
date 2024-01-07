@@ -15,11 +15,11 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 from torchvision import transforms
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
-from methods.token2attn.attn_control import EmptyControl
+from DiffSketcher.methods.token2attn.attn_control import EmptyControl
 
 
-from methods.token2attn.attn_control import AttentionStore
-from methods.token2attn.ptp_utils import text_under_image, view_images
+from DiffSketcher.methods.token2attn.attn_control import AttentionStore
+from DiffSketcher.methods.token2attn.ptp_utils import text_under_image, view_images
 
 
 class LSDSPipeline(StableDiffusionPipeline):
@@ -503,7 +503,8 @@ class LSDSPipeline(StableDiffusionPipeline):
                                 img_size: int = 224,
                                 max_com=10,
                                 select: int = 0,
-                                save_path: AnyStr = None):
+                                save_path: AnyStr = None, 
+                                index:int=None):
         attention_maps = self.aggregate_attention(prompts, attention_store, res, from_where, False, select)
         attention_maps = attention_maps.numpy().reshape((res ** 2, res ** 2))
         # shape: [res ** 2, res ** 2]
@@ -529,7 +530,7 @@ class LSDSPipeline(StableDiffusionPipeline):
             images.append(image)
         image_array = np.stack(images, axis=0)
         view_images(image_array, num_rows=max_com // 10, offset_ratio=0,
-                    save_image=True, fp=save_path / "self-attn-vh.png")
+                    save_image=True, fp=save_path / f"self-attn-vh{index}.png")
 
         return attention_maps, (u, s, vh), np.stack(vh_returns, axis=0)
 
