@@ -3,6 +3,7 @@
 # Author: XiMing Xing
 # Description:
 
+import datetime
 from functools import partial
 from PIL import Image
 from typing import Union, AnyStr, List
@@ -42,6 +43,12 @@ from methods.token2attn.attn_control import AttentionStore, EmptyControl
 
 class VectorFusionPipeline(ModelState):
     def __init__(self, args):
+        now = datetime.datetime.now()
+
+        # Format the date and time as a string, for example '2024-01-06_15-30-25'
+        formatted_date_time = now.strftime("%Y-%m-%d_%H-%M-%S")
+
+        # Your base file path or directory
         logdir_ = (
             f"{'scratch' if args.skip_live else 'baseline'}"
             f"-{args.model_id}"
@@ -50,10 +57,10 @@ class VectorFusionPipeline(ModelState):
             f"-im{args.image_size}"
             f"-P{args.num_paths}"
             f"{'-RePath' if args.path_reinit.use else ''}"
-        )
+            f"{formatted_date_time}" )
         super().__init__(args, log_path_suffix=logdir_)
 
-        wandb.init()
+        wandb.init(entity="aiis-chair",group="guidanceScale")
 
         assert args.style in ["iconography", "pixelart", "sketch"]
 
@@ -242,6 +249,24 @@ class VectorFusionPipeline(ModelState):
         )
 
         return diffusion_samples
+    
+    def get_diffusion_sample(self, text_prompt: AnyStr):
+        select_fpth = self.select_fpth
+        # sampling K images
+        diffusion_samples = self.diffusion_sampling(text_prompt)
+        # rejection sampling
+        select_target = self.rejection_sampling(text_prompt, diffusion_samples)
+        select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
+        select_target_pil.save(select_fpth)
+
+        # empty cache
+        torch.cuda.empty_cache()
+
+        # load target file
+        assert select_fpth.exists(), f"{select_fpth} is not exist!"
+        target_img = self.target_file_preprocess(select_fpth.as_posix())
+        
+        return target_img
 
     def LIVE_rendering(self, text_prompt: AnyStr):
         select_fpth = self.select_fpth
@@ -258,6 +283,8 @@ class VectorFusionPipeline(ModelState):
         # load target file
         assert select_fpth.exists(), f"{select_fpth} is not exist!"
         target_img = self.target_file_preprocess(select_fpth.as_posix())
+        
+
         self.print(f"load target file from: {select_fpth.as_posix()}")
 
         # log path_schedule
@@ -401,6 +428,8 @@ class VectorFusionPipeline(ModelState):
             target_img = torch.zeros(
                 self.args.batch_size, 3, self.args.image_size, self.args.image_size
             )
+            if self.args.use_jvsp:
+                target_img = self.get_diffusion_sample(text_prompt)
             final_svg_fpth = None
             self.print("from scratch with Score Distillation Sampling...")
         else:
@@ -479,7 +508,7 @@ class VectorFusionPipeline(ModelState):
                 # Taken from https://github.com/ximinng/DiffSketcher/blob/e4c03a6abd30dcb4b63ae5867f0bcc181ad0dccc/pipelines/painter/diffsketcher_pipeline.py
                 l_percep = torch.tensor(0.0)
                 total_visual_loss = torch.tensor(0.0)
-                if not self.args.skip_live:
+                if (not self.args.skip_live ) or self.args.use_jvsp:
                     # Similarity loss to diffusion sample
                     # L_sim = (
                     #     # self.diffusion.similarity_loss(raster_img, target_img)
@@ -527,6 +556,8 @@ class VectorFusionPipeline(ModelState):
                         "L_total": loss.item(), 
                         "L_sds": L_sds.item(), 
                         "L_add": L_add.item(),
+                        "l_percep": l_percep.item(), 
+                        "total_visual_loss": total_visual_loss.item(),
                     }
                 )
 

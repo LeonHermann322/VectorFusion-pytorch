@@ -4,7 +4,7 @@
 # Description:
 
 from typing import Callable, List,Literal, Optional, Union, Tuple, AnyStr
-
+import wandb
 import PIL
 from PIL import Image
 import numpy as np
@@ -15,6 +15,7 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 from torchvision import transforms
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
+from methods.token2attn.attn_control import EmptyControl
 
 
 from methods.token2attn.attn_control import AttentionStore
@@ -54,7 +55,7 @@ class LSDSPipeline(StableDiffusionPipeline):
         prompt: Union[str, List[str]],
         height: Optional[int] = None,
         width: Optional[int] = None,
-        controller: AttentionStore = None,  # feed attention_store as control of ptp
+        controller: AttentionStore = EmptyControl(),  # feed attention_store as control of ptp
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -414,7 +415,7 @@ class LSDSPipeline(StableDiffusionPipeline):
         grad = torch.nan_to_num(grad)
 
         # since we omitted an item in grad, we need to use the custom function to specify the gradient
-        # loss = SpecifyGradient.apply(latents, grad)
+        #loss = SpecifyGradient.apply(latents, grad)
         loss = (grad * latents).sum()
 
         return loss, grad.mean()
@@ -583,4 +584,5 @@ class SpecifyGradient(torch.autograd.Function):
     def backward(ctx, grad_scale):
         (gt_grad,) = ctx.saved_tensors
         gt_grad = gt_grad * grad_scale
+        wandb.log({"gt_grad":gt_grad, "gt_grad mean": gt_grad.mean()})
         return gt_grad, None

@@ -60,6 +60,7 @@ xing_loss_weight: 0.01
 penalty_weight: 0.05
 
 # JVSP
+use_jvsp: True
 clip:
   model_name: "RN101"  # RN101, ViT-L/14
   feats_loss_type: "l2" # clip visual loss type, conv layers
