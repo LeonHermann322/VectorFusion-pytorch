@@ -53,6 +53,8 @@ def main(args, seed_range):
         pipe.painterly_rendering(args.prompt)
     else:  # generate many SVG at once
         render_batch_fn(pipeline=VectorFusionPipeline, text_prompt=args.prompt)
+        
+    return True
 
 
 if __name__ == '__main__':

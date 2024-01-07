@@ -160,3 +160,6 @@ lightning_logs/*
 /LIST.md
 /assets/poster/
 /assets/poster/*
+
+# wandb
+wandb

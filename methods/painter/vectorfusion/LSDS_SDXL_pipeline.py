@@ -412,7 +412,8 @@ class LSDSSDXLPipeline(StableDiffusionXLPipeline):
         grad = torch.nan_to_num(grad)
 
         # since we omitted an item in grad, we need to use the custom function to specify the gradient
-        loss = SpecifyGradient.apply(latents, grad)
+        # loss = SpecifyGradient.apply(latents, grad)
+        loss = (grad * latents).sum()
 
         return loss, grad.mean()
 
