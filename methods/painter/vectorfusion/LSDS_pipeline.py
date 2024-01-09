@@ -15,11 +15,10 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 from torchvision import transforms
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
-from DiffSketcher.methods.token2attn.attn_control import EmptyControl
 
+from methods.token2attn.attn_control import EmptyControl, AttentionStore
 
-from DiffSketcher.methods.token2attn.attn_control import AttentionStore
-from DiffSketcher.methods.token2attn.ptp_utils import text_under_image, view_images
+from methods.token2attn.ptp_utils import text_under_image, view_images
 
 
 class LSDSPipeline(StableDiffusionPipeline):
