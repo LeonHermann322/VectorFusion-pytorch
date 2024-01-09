@@ -14,6 +14,7 @@ from typing import Any, List
 from functools import partial
 
 from accelerate.utils import set_seed
+from methods.painter.vectorfusion.utils import TimeLogger
 import omegaconf
 
 sys.path.append(os.path.split(os.path.abspath(os.path.dirname(__file__)))[0])
@@ -47,13 +48,22 @@ def main(args, seed_range):
         args.schedule_each = ast.literal_eval(args.schedule_each)
     if not isinstance(args.sds.t_range, omegaconf.ListConfig):
         args.sds.t_range = ast.literal_eval(args.sds.t_range)
-
+    
+    total_log= TimeLogger(name="total")
     if not args.render_batch:
+        init_log= TimeLogger(name="init")
         pipe = VectorFusionPipeline(args)
+        
+        init_log.finish()
+        
+        paint_log = TimeLogger(name="paint")
         pipe.painterly_rendering(args.prompt)
+        paint_log.finish()
     else:  # generate many SVG at once
         render_batch_fn(pipeline=VectorFusionPipeline, text_prompt=args.prompt)
-        
+    
+    total_log.finish()
+    
     return True
 
 

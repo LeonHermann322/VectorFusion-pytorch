@@ -4,6 +4,7 @@
 # Description:
 
 import datetime
+from methods.painter.vectorfusion.utils import TimeLogger
 from functools import partial
 from PIL import Image
 from typing import Union, AnyStr, List
@@ -57,7 +58,7 @@ class VectorFusionPipeline(ModelState):
             f"-im{args.image_size}"
             f"-P{args.num_paths}"
             f"{'-RePath' if args.path_reinit.use else ''}"
-            f"{formatted_date_time}" )
+            #f"{formatted_date_time}" )
         super().__init__(args, log_path_suffix=logdir_)
 
         wandb.init(entity="aiis-chair",group="guidanceScale")
@@ -252,13 +253,20 @@ class VectorFusionPipeline(ModelState):
     
 
     def LIVE_rendering(self, text_prompt: AnyStr):
+        
+        
         select_fpth = self.select_fpth
         # sampling K images
+        k_sampling_timelog = TimeLogger("k_sampling_and_clip_rejction")
         diffusion_samples = self.diffusion_sampling(text_prompt)
         # rejection sampling
         select_target, _ = self.rejection_sampling(text_prompt, diffusion_samples)
         select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
         select_target_pil.save(select_fpth)
+        
+        k_sampling_timelog.finish()
+        
+        live_timelog = TimeLogger(name="live")
 
         # empty cache
         torch.cuda.empty_cache()
@@ -399,6 +407,8 @@ class VectorFusionPipeline(ModelState):
         # end LIVE
         final_svg_fpth = self.results_path / "live_stage_one_final.svg"
         renderer.save_svg(final_svg_fpth)
+        
+        live_timelog.finish()
 
         return target_img, final_svg_fpth
 
@@ -430,6 +440,7 @@ class VectorFusionPipeline(ModelState):
             target_img = target_img.detach()  # inputs as GT
             self.print("inputs shape: ", target_img.shape)
         
+        vetor_fusion_timelog = TimeLogger(name="vector_fusion_part")
         renderer = self.load_renderer(target_img, path_svg=self.args.path_svg, attention_map=attention_map)
 
         if self.args.skip_live:
@@ -598,6 +609,7 @@ class VectorFusionPipeline(ModelState):
 
         final_svg_fpth = self.results_path / "finetune_final.svg"
         renderer.save_svg(final_svg_fpth)
+        vetor_fusion_timelog.finish()
 
         self.close(msg="painterly rendering complete.")
 
@@ -630,7 +642,9 @@ class VectorFusionPipeline(ModelState):
         self_attention_comp_outputs = []
         
         select_fpth = self.select_fpth
-
+        
+        k_sampling_timelog = TimeLogger("k_sampling_and_clip_rejction")
+        
         # sampling K images
         diffusion_samples = []
         for i in range(self.args.K):
@@ -689,10 +703,9 @@ class VectorFusionPipeline(ModelState):
         select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
         select_target_pil.save(select_fpth)
         
-        # load target file
-        assert select_fpth.exists(), f"{select_fpth} is not exist!"
-        target_img = self.target_file_preprocess(select_fpth.as_posix())
-        
+        k_sampling_timelog.finish()
+        attention_collect_timelog = TimeLogger("attention_collect")
+               
 
         target_path = self.results_path / "ldm_generated_image.png"
         view_images([np.array(select_target)], save_image=True, fp=target_path)
@@ -745,6 +758,7 @@ class VectorFusionPipeline(ModelState):
         # to [0, 1]
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
         self.print(f"-> fusion attn_map: {attn_map.shape}")
+        attention_collect_timelog.finish()
         
         return target_path, attn_map
 
