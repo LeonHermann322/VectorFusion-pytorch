@@ -1,5 +1,5 @@
 seed: 1
-image_size: 600
+image_size: 512
 path_svg: ~  # if you want to load a svg file and train from it
 skip_live: False
 style: "iconography" # "pixelart", "sketch"
