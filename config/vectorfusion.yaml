@@ -26,7 +26,7 @@ width: 3 # stroke width
 num_segments: 4
 segment_init: 'circle' # 'random'
 radius: 20
-coord_init: 'attention' # 'random', 'naive', place the first control point
+coord_init: 'sparse' # 'random', 'naive', place the first control point
 grid: 32 # divide the canvas into n grids
 path_reinit: # reinitializing paths
   use: True
@@ -42,7 +42,7 @@ enable_xformers: False
 gradient_checkpoint: False
 num_inference_steps: 50
 guidance_scale: 7.5 # sdxl default 5.0
-K: 6
+K: 20
 lora_path: ~
 
 # SDS
@@ -74,7 +74,7 @@ clip:
 perceptual:
   name: "lpips" # dists
   lpips_net: 'vgg'
-  coeff: 0.2
+  coeff: 1.0
   
 token_ind: 1 # the index of CLIP prompt embedding, start from 1, 0 is start token
 attention_init: True # if True, use the attention heads of Dino model to set the location of the initial strokes
@@ -88,3 +88,8 @@ comp_idx: 0 # if mean_comp==False, indicates the index of the self-attn map
 attn_coeff: 1.0 # attn fusion, w * cross-attn + (1-w) * self-attn
 log_cross_attn: False # True if cross attn every step
 u2net_path: "./checkpoint/u2net/u2net.pth"
+
+# Reverse diffusion and prompt
+reverse_diffusion_mode: "finetuning" # Choices: "sampling", "finetuning", "none"
+reverse_diffusion_embedding_mode: "interpolate" # Choices: "hard_cut", "interpolated", is only evaluated if mode is finetuning
+attribute_importance: 0.3 # should be between 0.0 and 1.0

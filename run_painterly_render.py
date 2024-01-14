@@ -22,16 +22,17 @@ from libs.engine import merge_and_update_config
 from libs.utils.argparse import accelerate_parser, base_data_parser
 
 
-def render_batch_wrap(args: omegaconf.DictConfig,
-                      seed_range: List,
-                      pipeline: Any,
-                      **pipe_args):
+def render_batch_wrap(
+    args: omegaconf.DictConfig, seed_range: List, pipeline: Any, **pipe_args
+):
     start_time = datetime.now()
     for idx, seed in enumerate(seed_range):
         args.seed = seed  # update seed
-        print(f"\n-> [{idx}/{len(seed_range)}], "
-              f"current seed: {seed}, "
-              f"current time: {datetime.now() - start_time}\n")
+        print(
+            f"\n-> [{idx}/{len(seed_range)}], "
+            f"current seed: {seed}, "
+            f"current time: {datetime.now() - start_time}\n"
+        )
         pipe = pipeline(args)
         pipe.painterly_rendering(**pipe_args)
 
@@ -43,55 +44,92 @@ def main(args, seed_range):
 
     from pipelines.painter.VectorFusion_pipeline import VectorFusionPipeline
 
-    if args.path_schedule == 'list' and not isinstance(args.schedule_each, omegaconf.ListConfig):
+    if args.path_schedule == "list" and not isinstance(
+        args.schedule_each, omegaconf.ListConfig
+    ):
         args.schedule_each = ast.literal_eval(args.schedule_each)
     if not isinstance(args.sds.t_range, omegaconf.ListConfig):
         args.sds.t_range = ast.literal_eval(args.sds.t_range)
 
     if not args.render_batch:
         pipe = VectorFusionPipeline(args)
-        pipe.painterly_rendering(args.prompt)
+        pipe.painterly_rendering(args.prompt, args.attribute)
     else:  # generate many SVG at once
         render_batch_fn(pipeline=VectorFusionPipeline, text_prompt=args.prompt)
         
     return True
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="vectorfusion rendering",
-        parents=[accelerate_parser(), base_data_parser()]
+        parents=[accelerate_parser(), base_data_parser()],
     )
     # config
-    parser.add_argument("-c", "--config",
-                        required=True, type=str,
-                        default="",
-                        help="YAML/YML file for configuration.")
+    parser.add_argument(
+        "-c",
+        "--config",
+        required=True,
+        type=str,
+        default="",
+        help="YAML/YML file for configuration.",
+    )
     # prompt
-    parser.add_argument("-pt", "--prompt", default="A horse is drinking water by the lake", type=str)
+    parser.add_argument(
+        "-pt", "--prompt", default="A horse is drinking water by the lake", type=str
+    )
+    parser.add_argument(
+        "-at",
+        "--attribute",
+        default="",
+        type=str,
+    )
     parser.add_argument("-npt", "--negative_prompt", default="", type=str)
     # DiffSVG
-    parser.add_argument("--print_timing", "-timing", action="store_true",
-                        help="set print svg rendering timing.")
+    parser.add_argument(
+        "--print_timing",
+        "-timing",
+        action="store_true",
+        help="set print svg rendering timing.",
+    )
     # diffuser
-    parser.add_argument("--download", action="store_true",
-                        help="download models from huggingface automatically.")
-    parser.add_argument("--force_download", "-download", action="store_true",
-                        help="force the models to be downloaded from huggingface.")
-    parser.add_argument("--resume_download", "-dpm_resume", action="store_true",
-                        help="download the models again from the breakpoint.")
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="download models from huggingface automatically.",
+    )
+    parser.add_argument(
+        "--force_download",
+        "-download",
+        action="store_true",
+        help="force the models to be downloaded from huggingface.",
+    )
+    parser.add_argument(
+        "--resume_download",
+        "-dpm_resume",
+        action="store_true",
+        help="download the models again from the breakpoint.",
+    )
     # rendering quantity
     # like: python main.py -rdbz -srange 100 200
     parser.add_argument("--render_batch", "-rdbz", action="store_true")
-    parser.add_argument("-srange", "--seed_range",
-                        required=False, nargs='+',
-                        help="Sampling quantity.")
+    parser.add_argument(
+        "-srange", "--seed_range", required=False, nargs="+", help="Sampling quantity."
+    )
     # visual rendering process
-    parser.add_argument("-mv", "--make_video", action="store_true",
-                        help="make a video of the rendering process.")
-    parser.add_argument("-frame_freq", "--video_frame_freq",
-                        default=1, type=int,
-                        help="video frame control.")
+    parser.add_argument(
+        "-mv",
+        "--make_video",
+        action="store_true",
+        help="make a video of the rendering process.",
+    )
+    parser.add_argument(
+        "-frame_freq",
+        "--video_frame_freq",
+        default=1,
+        type=int,
+        help="video frame control.",
+    )
     args = parser.parse_args()
 
     # set the random seed range

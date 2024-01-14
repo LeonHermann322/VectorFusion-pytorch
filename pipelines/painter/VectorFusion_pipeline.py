@@ -8,6 +8,7 @@ from functools import partial
 from PIL import Image
 from typing import Union, AnyStr, List
 from skimage.color import rgb2gray
+from math import ceil
 
 from torchvision.datasets.folder import is_image_file
 
@@ -57,10 +58,11 @@ class VectorFusionPipeline(ModelState):
             f"-im{args.image_size}"
             f"-P{args.num_paths}"
             f"{'-RePath' if args.path_reinit.use else ''}"
-            f"{formatted_date_time}" )
+            f"{formatted_date_time}"
+        )
         super().__init__(args, log_path_suffix=logdir_)
 
-        wandb.init(entity="aiis-chair",group="guidanceScale")
+        wandb.init(entity="aiis-chair", group="guidanceScale")
 
         assert args.style in ["iconography", "pixelart", "sketch"]
 
@@ -223,21 +225,53 @@ class VectorFusionPipeline(ModelState):
         selected_image = diffusion_samples[selected_image_index]
         return selected_image, selected_image_index
 
-    def diffusion_sampling(self, text_prompt: AnyStr):
+    def diffusion_sampling(self, text_prompt: AnyStr, attribute: AnyStr | None = None):
         """sampling K images"""
         diffusion_samples = []
         for i in range(self.args.K):
             height = width = model2res(self.args.model_id)
-            outputs = self.diffusion(
-                prompt=[text_prompt],
-                negative_prompt=self.args.negative_prompt,
-                height=height,
-                width=width,
-                num_images_per_prompt=1,
-                num_inference_steps=self.args.num_inference_steps,
-                guidance_scale=self.args.guidance_scale,
-                generator=self.g_device,
-            )
+            if self.args.reverse_diffusion_mode == "sampling":
+                inf_steps_prompt = ceil(
+                    self.args.num_inference_steps * self.args.attribute_importance
+                )
+                inf_steps_attr = self.args.num_inference_steps - inf_steps_prompt
+                latents, _ = self.diffusion(
+                    prompt=[text_prompt],
+                    negative_prompt=self.args.negative_prompt,
+                    height=height,
+                    width=width,
+                    controller=EmptyControl(),
+                    num_images_per_prompt=1,
+                    num_inference_steps=inf_steps_prompt,
+                    guidance_scale=self.args.guidance_scale,
+                    output_type="latents",
+                    return_dict=False,
+                    generator=self.g_device,
+                )
+                outputs = self.diffusion(
+                    prompt=[attribute],
+                    negative_prompt=self.args.negative_prompt,
+                    height=height,
+                    width=width,
+                    controller=EmptyControl(),
+                    latents=latents,
+                    num_images_per_prompt=1,
+                    num_inference_steps=inf_steps_attr,
+                    guidance_scale=self.args.guidance_scale,
+                    generator=self.g_device,
+                )
+            else:
+                outputs = self.diffusion(
+                    prompt=[text_prompt],
+                    negative_prompt=self.args.negative_prompt,
+                    height=height,
+                    width=width,
+                    controller=EmptyControl(),
+                    num_images_per_prompt=1,
+                    num_inference_steps=self.args.num_inference_steps,
+                    guidance_scale=self.args.guidance_scale,
+                    generator=self.g_device,
+                )
             outputs_np = [np.array(img) for img in outputs.images]
             view_images(
                 outputs_np, save_image=True, fp=self.sd_sample_dir / f"samples_{i}.png"
@@ -249,12 +283,14 @@ class VectorFusionPipeline(ModelState):
         )
 
         return diffusion_samples
-    
 
-    def LIVE_rendering(self, text_prompt: AnyStr):
+    def LIVE_rendering(self, text_prompt: AnyStr, attribute: AnyStr | None = None):
         select_fpth = self.select_fpth
         # sampling K images
-        diffusion_samples = self.diffusion_sampling(text_prompt)
+        if self.args.reverse_diffusion_mode == "sampling":
+            diffusion_samples = self.diffusion_sampling(text_prompt, attribute)
+        else:
+            diffusion_samples = self.diffusion_sampling(text_prompt)
         # rejection sampling
         select_target, _ = self.rejection_sampling(text_prompt, diffusion_samples)
         select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
@@ -266,7 +302,6 @@ class VectorFusionPipeline(ModelState):
         # load target file
         assert select_fpth.exists(), f"{select_fpth} is not exist!"
         target_img = self.target_file_preprocess(select_fpth.as_posix())
-        
 
         self.print(f"load target file from: {select_fpth.as_posix()}")
 
@@ -402,7 +437,7 @@ class VectorFusionPipeline(ModelState):
 
         return target_img, final_svg_fpth
 
-    def painterly_rendering(self, text_prompt: AnyStr):
+    def painterly_rendering(self, text_prompt: AnyStr, attribute: AnyStr | None = None):
         # log prompts
         self.print(f"prompt: {text_prompt}")
         self.print(f"negative_prompt: {self.args.negative_prompt}\n")
@@ -416,30 +451,50 @@ class VectorFusionPipeline(ModelState):
         else:
             # text-to-img-to-svg
             if self.args.coord_init == "attention":
-                raise("Attention Init does not work with live,")
-            target_img, final_svg_fpth = self.LIVE_rendering(text_prompt)
+                raise ("Attention Init does not work with live,")
+            target_img, final_svg_fpth = self.LIVE_rendering(text_prompt, attribute)
             torch.cuda.empty_cache()
             self.args.path_svg = final_svg_fpth
             self.print("\nfine-tune SVG via Score Distillation Samplig...")
 
+        if (
+            self.args.reverse_diffusion_mode == "finetuning"
+            and self.args.reverse_diffusion_embedding_mode == "interpolated"
+        ):
+            prompt_embedding = self.diffusion._encode_prompt(
+                text_prompt,
+                self.device,
+                1,
+                self.args.sds.guidance_scale > 1.0,
+                negative_prompt=self.args.negative_prompt,
+            )
+            attribute_embedding = self.diffusion._encode_prompt(
+                attribute,
+                self.device,
+                1,
+                self.args.sds.guidance_scale > 1.0,
+                negative_prompt=self.args.negative_prompt,
+            )
+
         attention_map = None
         if self.args.coord_init == "attention":
             target_img, attention_map = self.extract_ldm_attn(prompts=text_prompt)
-            target_img = self.get_target(target_img,
-                                       self.args.image_size)
+            target_img = self.get_target(target_img, self.args.image_size)
             target_img = target_img.detach()  # inputs as GT
             self.print("inputs shape: ", target_img.shape)
-        
-        renderer = self.load_renderer(target_img, path_svg=self.args.path_svg, attention_map=attention_map)
+
+        renderer = self.load_renderer(
+            target_img, path_svg=self.args.path_svg, attention_map=attention_map
+        )
 
         if self.args.skip_live:
-            init_type = 'random'
+            init_type = "random"
             if self.args.coord_init == "attention":
                 init_type = self.args.coord_init
-            renderer.component_wise_path_init(pred=None, init_type= init_type)
+            renderer.component_wise_path_init(pred=None, init_type=init_type)
 
         img = renderer.init_image(stage=0, num_paths=self.args.num_paths)
-        
+
         log_tensor_img(img, self.results_path, output_prefix=f"init_img_stage_two")
 
         optimizer = PainterOptimizer(
@@ -459,6 +514,8 @@ class VectorFusionPipeline(ModelState):
         total_step = self.args.sds.num_iter
         path_reinit = self.args.path_reinit
 
+        max_attribute_shift_step = total_step * (1.0 - self.args.attribute_importance)
+
         self.print(f"\ntotal sds optimization steps: {total_step}")
         with tqdm(
             initial=self.step,
@@ -468,15 +525,62 @@ class VectorFusionPipeline(ModelState):
             while self.step < total_step:
                 raster_img = renderer.get_image(step=self.step).to(self.device)
 
-                L_sds, grad = self.diffusion.score_distillation_sampling(
-                    raster_img,
-                    im_size=self.args.sds.im_size,
-                    prompt=[text_prompt],
-                    negative_prompt=self.args.negative_prompt,
-                    guidance_scale=self.args.sds.guidance_scale,
-                    grad_scale=self.args.sds.grad_scale,
-                    t_range=list(self.args.sds.t_range),
-                )
+                if self.args.reverse_diffusion_mode == "finetuning":
+                    if self.args.reverse_diffusion_embedding_mode == "interpolated":
+                        # rev coeff 0.0 -> all prompt, 1.0 -> all attribute
+                        rev_coeff = min(
+                            self.step / max_attribute_shift_step
+                            if max_attribute_shift_step > 0
+                            else 1.0,
+                            1.0,
+                        )
+                        text_embedding = (
+                            rev_coeff * attribute_embedding
+                            + (1.0 - rev_coeff) * prompt_embedding
+                        )
+                        L_sds, grad = self.diffusion.reverse_diffusion_sds(
+                            raster_img,
+                            im_size=self.args.sds.im_size,
+                            text_embedding=text_embedding,
+                            guidance_scale=self.args.sds.guidance_scale,
+                            grad_scale=self.args.sds.grad_scale,
+                            t_range=list(self.args.sds.t_range),
+                        )
+                    else:
+                        shift_to_attribute = (
+                            self.step > total_step * self.args.attribute_importance
+                        )
+                        prompt = attribute if shift_to_attribute else text_prompt
+
+                        L_sds, grad = self.diffusion.score_distillation_sampling(
+                            raster_img,
+                            im_size=self.args.sds.im_size,
+                            prompt=[prompt],
+                            negative_prompt=self.args.negative_prompt,
+                            guidance_scale=self.args.sds.guidance_scale,
+                            grad_scale=self.args.sds.grad_scale,
+                            t_range=list(self.args.sds.t_range),
+                        )
+                elif self.args.reverse_diffusion_mode == "sampling":
+                    L_sds, grad = self.diffusion.score_distillation_sampling(
+                        raster_img,
+                        im_size=self.args.sds.im_size,
+                        prompt=[attribute],
+                        negative_prompt=self.args.negative_prompt,
+                        guidance_scale=self.args.sds.guidance_scale,
+                        grad_scale=self.args.sds.grad_scale,
+                        t_range=list(self.args.sds.t_range),
+                    )
+                else:
+                    L_sds, grad = self.diffusion.score_distillation_sampling(
+                        raster_img,
+                        im_size=self.args.sds.im_size,
+                        prompt=[text_prompt],
+                        negative_prompt=self.args.negative_prompt,
+                        guidance_scale=self.args.sds.guidance_scale,
+                        grad_scale=self.args.sds.grad_scale,
+                        t_range=list(self.args.sds.t_range),
+                    )
                 # Xing Loss for Self-Interaction Problem
                 L_add = torch.tensor(0.0)
                 if self.args.style == "iconography":
@@ -491,7 +595,7 @@ class VectorFusionPipeline(ModelState):
                 # Taken from https://github.com/ximinng/DiffSketcher/blob/e4c03a6abd30dcb4b63ae5867f0bcc181ad0dccc/pipelines/painter/diffsketcher_pipeline.py
                 l_percep = torch.tensor(0.0)
                 total_visual_loss = torch.tensor(0.0)
-                if (not self.args.skip_live ) or self.args.use_jvsp:
+                if (not self.args.skip_live) or self.args.use_jvsp:
                     # Similarity loss to diffusion sample
                     # L_sim = (
                     #     # self.diffusion.similarity_loss(raster_img, target_img)
@@ -536,10 +640,10 @@ class VectorFusionPipeline(ModelState):
 
                 wandb.log(
                     {
-                        "L_total": loss.item(), 
-                        "L_sds": L_sds.item(), 
+                        "L_total": loss.item(),
+                        "L_sds": L_sds.item(),
                         "L_add": L_add.item(),
-                        "l_percep": l_percep.item(), 
+                        "l_percep": l_percep.item(),
                         "total_visual_loss": total_visual_loss.item(),
                     }
                 )
@@ -602,33 +706,35 @@ class VectorFusionPipeline(ModelState):
         self.close(msg="painterly rendering complete.")
 
     def load_renderer(self, target_img, path_svg=None, attention_map=None):
-        renderer = Painter(self.args.style,
-                           target_img,
-                           self.args.num_segments,
-                           self.args.segment_init,
-                           self.args.radius,
-                           self.args.image_size,
-                           self.args.grid,
-                           self.args.trainable_bg,
-                           self.args.train_stroke,
-                           self.args.width,
-                           path_svg=path_svg,
-                            device=self.device,
-                            attention_map=attention_map,
-                            softmax_temp=self.args.softmax_temp, 
-                            num_paths=self.args.num_paths, 
-                            num_stages=self.args.num_stages,
-                            xdog_intersec=self.args.xdog_intersec)
+        renderer = Painter(
+            self.args.style,
+            target_img,
+            self.args.num_segments,
+            self.args.segment_init,
+            self.args.radius,
+            self.args.image_size,
+            self.args.grid,
+            self.args.trainable_bg,
+            self.args.train_stroke,
+            self.args.width,
+            path_svg=path_svg,
+            device=self.device,
+            attention_map=attention_map,
+            softmax_temp=self.args.softmax_temp,
+            num_paths=self.args.num_paths,
+            num_stages=self.args.num_stages,
+            xdog_intersec=self.args.xdog_intersec,
+        )
         return renderer
-    
+
     def extract_ldm_attn(self, prompts):
         print("\n\nextract_ldm_attn with k sampling\n\n")
         # init controller
         controller = AttentionStore() if self.args.attention_init else EmptyControl()
-        
+
         cross_attention_outputs = []
         self_attention_comp_outputs = []
-        
+
         select_fpth = self.select_fpth
 
         # sampling K images
@@ -650,29 +756,31 @@ class VectorFusionPipeline(ModelState):
             view_images(
                 outputs_np, save_image=True, fp=self.sd_sample_dir / f"samples_{i}.png"
             )
-            
+
             """ldm cross-attention map"""
-            cross_attention_maps, tokens = \
-            self.diffusion.get_cross_attention([prompts],
-                                               controller,
-                                               res=self.args.cross_attn_res,
-                                               from_where=("up", "down"),
-                                               save_path=self.results_path / f"cross_attn{i}.png")
-            
+            cross_attention_maps, tokens = self.diffusion.get_cross_attention(
+                [prompts],
+                controller,
+                res=self.args.cross_attn_res,
+                from_where=("up", "down"),
+                save_path=self.results_path / f"cross_attn{i}.png",
+            )
+
             """ldm self-attention map"""
-            self_attention_maps, svd, vh_ = \
-            self.diffusion.get_self_attention_comp([prompts],
-                                                   controller,
-                                                   res=self.args.self_attn_res,
-                                                   from_where=("up", "down"),
-                                                   img_size=self.args.image_size,
-                                                   max_com=self.args.max_com,
-                                                   save_path=self.results_path, 
-                                                   index=i)
-            
+            self_attention_maps, svd, vh_ = self.diffusion.get_self_attention_comp(
+                [prompts],
+                controller,
+                res=self.args.self_attn_res,
+                from_where=("up", "down"),
+                img_size=self.args.image_size,
+                max_com=self.args.max_com,
+                save_path=self.results_path,
+                index=i,
+            )
+
             cross_attention_outputs.append((cross_attention_maps, tokens))
             self_attention_comp_outputs.append((self_attention_maps, svd, vh_))
-            
+
             diffusion_samples.extend(outputs.images)
             controller.reset()
 
@@ -680,31 +788,30 @@ class VectorFusionPipeline(ModelState):
             f"num_generated_samples: {len(diffusion_samples)}, shape: {outputs_np[0].shape}"
         )
         # rejection sampling
-        select_target, target_index = self.rejection_sampling(prompts, diffusion_samples)
+        select_target, target_index = self.rejection_sampling(
+            prompts, diffusion_samples
+        )
         # empty cache
         torch.cuda.empty_cache()
 
-        
         select_fpth = self.select_fpth
         select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
         select_target_pil.save(select_fpth)
-        
+
         # load target file
         assert select_fpth.exists(), f"{select_fpth} is not exist!"
         target_img = self.target_file_preprocess(select_fpth.as_posix())
-        
 
         target_path = self.results_path / "ldm_generated_image.png"
         view_images([np.array(select_target)], save_image=True, fp=target_path)
 
-        
-        
-        '''Attention Map calculating'''
-        self_attention_maps, svd, vh_  = self_attention_comp_outputs[target_index] 
+        """Attention Map calculating"""
+        self_attention_maps, svd, vh_ = self_attention_comp_outputs[target_index]
         cross_attention_maps, tokens = cross_attention_outputs[target_index]
-        
-        
-        self.print(f"the length of tokens is {len(tokens)}, select {self.args.token_ind}-th token")
+
+        self.print(
+            f"the length of tokens is {len(tokens)}, select {self.args.token_ind}-th token"
+        )
         # [res, res, seq_len]
         self.print(f"origin cross_attn_map shape: {cross_attention_maps.shape}")
         # [res, res]
@@ -716,16 +823,27 @@ class VectorFusionPipeline(ModelState):
         # [3, res, res]
         cross_attn_map = cross_attn_map.permute(2, 0, 1).unsqueeze(0)
         # [3, clip_size, clip_size]
-        cross_attn_map = F.interpolate(cross_attn_map, size=self.args.image_size, mode='bicubic')
+        cross_attn_map = F.interpolate(
+            cross_attn_map, size=self.args.image_size, mode="bicubic"
+        )
         cross_attn_map = torch.clamp(cross_attn_map, min=0, max=255)
         # rgb to gray
-        cross_attn_map = rgb2gray(cross_attn_map.squeeze(0).permute(1, 2, 0)).astype(np.float32)
+        cross_attn_map = rgb2gray(cross_attn_map.squeeze(0).permute(1, 2, 0)).astype(
+            np.float32
+        )
         # torch to numpy
-        if cross_attn_map.shape[-1] != self.args.image_size and cross_attn_map.shape[-2] != self.args.image_size:
-            cross_attn_map = cross_attn_map.reshape(self.args.image_size, self.args.image_size)
+        if (
+            cross_attn_map.shape[-1] != self.args.image_size
+            and cross_attn_map.shape[-2] != self.args.image_size
+        ):
+            cross_attn_map = cross_attn_map.reshape(
+                self.args.image_size, self.args.image_size
+            )
         # to [0, 1]
-        cross_attn_map = (cross_attn_map - cross_attn_map.min()) / (cross_attn_map.max() - cross_attn_map.min())
-        
+        cross_attn_map = (cross_attn_map - cross_attn_map.min()) / (
+            cross_attn_map.max() - cross_attn_map.min()
+        )
+
         # comp self-attention map
         if self.args.mean_comp:
             self_attn = np.mean(vh_, axis=0)
@@ -738,19 +856,24 @@ class VectorFusionPipeline(ModelState):
         # visual final self-attention
         self_attn_vis = np.copy(self_attn)
         self_attn_vis = self_attn_vis * 255
-        self_attn_vis = np.repeat(np.expand_dims(self_attn_vis, axis=2), 3, axis=2).astype(np.uint8)
-        view_images(self_attn_vis, save_image=True, fp=self.results_path / "self-attn-final.png")
+        self_attn_vis = np.repeat(
+            np.expand_dims(self_attn_vis, axis=2), 3, axis=2
+        ).astype(np.uint8)
+        view_images(
+            self_attn_vis, save_image=True, fp=self.results_path / "self-attn-final.png"
+        )
         """attention map fusion"""
-        attn_map = self.args.attn_coeff * cross_attn_map + (1 - self.args.attn_coeff) * self_attn
+        attn_map = (
+            self.args.attn_coeff * cross_attn_map
+            + (1 - self.args.attn_coeff) * self_attn
+        )
         # to [0, 1]
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
         self.print(f"-> fusion attn_map: {attn_map.shape}")
-        
+
         return target_path, attn_map
 
-    def get_target(self,
-                   target_file,
-                   image_size):
+    def get_target(self, target_file, image_size):
         if not is_image_file(str(target_file)):
             raise TypeError(f"{target_file} is not image file.")
 
@@ -763,8 +886,6 @@ class VectorFusionPipeline(ModelState):
             new_image.paste(target, (0, 0), target)
             target = new_image
         target = target.convert("RGB")
-
-    
 
         # define image transforms
         transforms_ = []

@@ -3,7 +3,7 @@
 # Author: XiMing Xing
 # Description:
 
-from typing import Callable, List,Literal, Optional, Union, Tuple, AnyStr
+from typing import Callable, List, Literal, Optional, Union, Tuple, AnyStr
 import wandb
 import PIL
 from PIL import Image
@@ -122,8 +122,7 @@ class LSDSPipeline(StableDiffusionPipeline):
             list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
             (nsfw) content, according to the `safety_checker`.
         """
-        
-        
+
         self.register_attention_control(controller)  # add attention controller
 
         # 0. Default height and width to unet
@@ -227,6 +226,8 @@ class LSDSPipeline(StableDiffusionPipeline):
         # 10. Convert to PIL
         if output_type == "pil":
             image = self.numpy_to_pil(image)
+        elif output_type == "latents":
+            image = latents
 
         if not return_dict:
             return (image, has_nsfw_concept)
@@ -339,6 +340,77 @@ class LSDSPipeline(StableDiffusionPipeline):
         else:
             return F.mse_loss(pred_latents, target_latents)
 
+    def reverse_diffusion_sds(
+        self,
+        pred_rgb: torch.Tensor,
+        im_size: int,
+        text_embedding: torch.Tensor,
+        guidance_scale: float = 100,
+        as_latent: bool = False,
+        grad_scale: float = 1,
+        t_range: Union[List[float], Tuple[float]] = (0.05, 0.95),
+    ):
+        num_train_timesteps = self.scheduler.config.num_train_timesteps
+        min_step = int(num_train_timesteps * t_range[0])
+        max_step = int(num_train_timesteps * t_range[1])
+        alphas = self.scheduler.alphas_cumprod.to(self.device)  # for convenience
+
+        # input augmentation
+        pred_rgb_a = self.x_augment(pred_rgb, im_size)
+
+        # the input is intercepted to im_size x im_size and then fed to the vae
+        if as_latent:
+            latents = (
+                F.interpolate(
+                    pred_rgb_a, (64, 64), mode="bilinear", align_corners=False
+                )
+                * 2
+                - 1
+            )
+        else:
+            # encode image into latents with vae, requires grad!
+            latents = self.encode_(pred_rgb_a)
+
+        #  Encode input prompt
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # timestep ~ U(0.05, 0.95) to avoid very high/low noise level
+        t = torch.randint(
+            min_step, max_step + 1, [1], dtype=torch.long, device=self.device
+        )
+
+        # predict the noise residual with unet, stop gradient
+        with torch.no_grad():
+            # add noise
+            noise = torch.randn_like(latents)
+            latents_noisy = self.scheduler.add_noise(latents, noise, t)
+            # pred noise
+            latent_model_input = (
+                torch.cat([latents_noisy] * 2)
+                if do_classifier_free_guidance
+                else latents_noisy
+            )
+            noise_pred = self.unet(
+                latent_model_input, t, encoder_hidden_states=text_embedding
+            ).sample
+
+        # perform guidance (high scale from paper!)
+        if do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                noise_pred_pos - noise_pred_uncond
+            )
+
+        # w(t), sigma_t^2
+        w = 1 - alphas[t]
+        grad = grad_scale * w * (noise_pred - noise)
+        grad = torch.nan_to_num(grad)
+
+        # since we omitted an item in grad, we need to use the custom function to specify the gradient
+        loss = SpecifyGradient.apply(latents, grad)
+
+        return loss, grad.mean()
+
     def score_distillation_sampling(
         self,
         pred_rgb: torch.Tensor,
@@ -415,7 +487,7 @@ class LSDSPipeline(StableDiffusionPipeline):
         grad = torch.nan_to_num(grad)
 
         # since we omitted an item in grad, we need to use the custom function to specify the gradient
-        #loss = SpecifyGradient.apply(latents, grad)
+        # loss = SpecifyGradient.apply(latents, grad)
         loss = (grad * latents).sum()
 
         return loss, grad.mean()
@@ -424,13 +496,19 @@ class LSDSPipeline(StableDiffusionPipeline):
         attn_procs = {}
         cross_att_count = 0
         for name in self.unet.attn_processors.keys():
-            cross_attention_dim = None if name.endswith("attn1.processor") else self.unet.config.cross_attention_dim
+            cross_attention_dim = (
+                None
+                if name.endswith("attn1.processor")
+                else self.unet.config.cross_attention_dim
+            )
             if name.startswith("mid_block"):
                 hidden_size = self.unet.config.block_out_channels[-1]
                 place_in_unet = "mid"
             elif name.startswith("up_blocks"):
                 block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(self.unet.config.block_out_channels))[block_id]
+                hidden_size = list(reversed(self.unet.config.block_out_channels))[
+                    block_id
+                ]
                 place_in_unet = "up"
             elif name.startswith("down_blocks"):
                 block_id = int(name[len("down_blocks.")])
@@ -447,39 +525,47 @@ class LSDSPipeline(StableDiffusionPipeline):
         controller.num_att_layers = cross_att_count
 
     @staticmethod
-    def aggregate_attention(prompts,
-                            attention_store: AttentionStore,
-                            res: int,
-                            from_where: List[str],
-                            is_cross: bool,
-                            select: int):
+    def aggregate_attention(
+        prompts,
+        attention_store: AttentionStore,
+        res: int,
+        from_where: List[str],
+        is_cross: bool,
+        select: int,
+    ):
         if isinstance(prompts, str):
             prompts = [prompts]
         assert isinstance(prompts, list)
 
         out = []
         attention_maps = attention_store.get_average_attention()
-        num_pixels = res ** 2
+        num_pixels = res**2
         for location in from_where:
             for item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]:
                 if item.shape[1] == num_pixels:
-                    cross_maps = item.reshape(len(prompts), -1, res, res, item.shape[-1])[select]
+                    cross_maps = item.reshape(
+                        len(prompts), -1, res, res, item.shape[-1]
+                    )[select]
                     out.append(cross_maps)
         out = torch.cat(out, dim=0)
         out = out.sum(0) / out.shape[0]
         return out.cpu()
 
-    def get_cross_attention(self,
-                            prompts,
-                            attention_store: AttentionStore,
-                            res: int,
-                            from_where: List[str],
-                            select: int = 0,
-                            save_path=None):
+    def get_cross_attention(
+        self,
+        prompts,
+        attention_store: AttentionStore,
+        res: int,
+        from_where: List[str],
+        select: int = 0,
+        save_path=None,
+    ):
         tokens = self.tokenizer.encode(prompts[select])
         decoder = self.tokenizer.decode
         # shape: [res ** 2, res ** 2, seq_len]
-        attention_maps = self.aggregate_attention(prompts, attention_store, res, from_where, True, select)
+        attention_maps = self.aggregate_attention(
+            prompts, attention_store, res, from_where, True, select
+        )
 
         images = []
         for i in range(len(tokens)):
@@ -495,24 +581,32 @@ class LSDSPipeline(StableDiffusionPipeline):
 
         return attention_maps, tokens
 
-    def get_self_attention_comp(self,
-                                prompts,
-                                attention_store: AttentionStore,
-                                res: int,
-                                from_where: List[str],
-                                img_size: int = 224,
-                                max_com=10,
-                                select: int = 0,
-                                save_path: AnyStr = None, 
-                                index:int=None):
-        attention_maps = self.aggregate_attention(prompts, attention_store, res, from_where, False, select)
-        attention_maps = attention_maps.numpy().reshape((res ** 2, res ** 2))
+    def get_self_attention_comp(
+        self,
+        prompts,
+        attention_store: AttentionStore,
+        res: int,
+        from_where: List[str],
+        img_size: int = 224,
+        max_com=10,
+        select: int = 0,
+        save_path: AnyStr = None,
+        index: int = None,
+    ):
+        attention_maps = self.aggregate_attention(
+            prompts, attention_store, res, from_where, False, select
+        )
+        attention_maps = attention_maps.numpy().reshape((res**2, res**2))
         # shape: [res ** 2, res ** 2]
-        u, s, vh = np.linalg.svd(attention_maps - np.mean(attention_maps, axis=1, keepdims=True))
-        print(f"self-attention_maps: {attention_maps.shape}, "
-              f"u: {u.shape}, "
-              f"s: {s.shape}, "
-              f"vh: {vh.shape}")
+        u, s, vh = np.linalg.svd(
+            attention_maps - np.mean(attention_maps, axis=1, keepdims=True)
+        )
+        print(
+            f"self-attention_maps: {attention_maps.shape}, "
+            f"u: {u.shape}, "
+            f"s: {s.shape}, "
+            f"vh: {vh.shape}"
+        )
 
         images = []
         vh_returns = []
@@ -521,7 +615,9 @@ class LSDSPipeline(StableDiffusionPipeline):
             image = (image - image.min()) / (image.max() - image.min())
             image = 255 * image
 
-            ret_ = Image.fromarray(image).resize((img_size, img_size), resample=PIL.Image.Resampling.BILINEAR)
+            ret_ = Image.fromarray(image).resize(
+                (img_size, img_size), resample=PIL.Image.Resampling.BILINEAR
+            )
             vh_returns.append(np.array(ret_))
 
             image = np.repeat(np.expand_dims(image, axis=2), 3, axis=2).astype(np.uint8)
@@ -529,27 +625,39 @@ class LSDSPipeline(StableDiffusionPipeline):
             image = np.array(image)
             images.append(image)
         image_array = np.stack(images, axis=0)
-        view_images(image_array, num_rows=max_com // 10, offset_ratio=0,
-                    save_image=True, fp=save_path / f"self-attn-vh{index}.png")
+        view_images(
+            image_array,
+            num_rows=max_com // 10,
+            offset_ratio=0,
+            save_image=True,
+            fp=save_path / f"self-attn-vh{index}.png",
+        )
 
         return attention_maps, (u, s, vh), np.stack(vh_returns, axis=0)
 
 
 class P2PCrossAttnProcessor:
-
     def __init__(self, controller, place_in_unet):
         super().__init__()
         self.controller = controller
         self.place_in_unet = place_in_unet
 
-    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None):
+    def __call__(
+        self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None
+    ):
         batch_size, sequence_length, _ = hidden_states.shape
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size=batch_size)
+        attention_mask = attn.prepare_attention_mask(
+            attention_mask, sequence_length, batch_size=batch_size
+        )
 
         query = attn.to_q(hidden_states)
 
         is_cross = encoder_hidden_states is not None
-        encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        encoder_hidden_states = (
+            encoder_hidden_states
+            if encoder_hidden_states is not None
+            else hidden_states
+        )
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
 
@@ -572,6 +680,7 @@ class P2PCrossAttnProcessor:
 
         return hidden_states
 
+
 class SpecifyGradient(torch.autograd.Function):
     @staticmethod
     @custom_fwd
@@ -585,5 +694,5 @@ class SpecifyGradient(torch.autograd.Function):
     def backward(ctx, grad_scale):
         (gt_grad,) = ctx.saved_tensors
         gt_grad = gt_grad * grad_scale
-        wandb.log({"gt_grad":gt_grad, "gt_grad mean": gt_grad.mean()})
+        wandb.log({"gt_grad": gt_grad, "gt_grad mean": gt_grad.mean()})
         return gt_grad, None
