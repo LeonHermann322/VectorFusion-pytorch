@@ -46,6 +46,7 @@ def plt_batch(
     plt.tight_layout()
     plt.savefig(f"{save_path}/{name}.png", dpi=dpi)
     plt.close()
+    return ndarr
 
 
 def insert_newline(string, point=9):

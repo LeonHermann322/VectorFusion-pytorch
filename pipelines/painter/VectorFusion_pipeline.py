@@ -60,7 +60,7 @@ class VectorFusionPipeline(ModelState):
             f"{formatted_date_time}" )
         super().__init__(args, log_path_suffix=logdir_)
 
-        wandb.init(entity="aiis-chair",group="guidanceScale")
+        wandb.init()
 
         assert args.style in ["iconography", "pixelart", "sketch"]
 
@@ -583,7 +583,7 @@ class VectorFusionPipeline(ModelState):
                     self.step % self.args.save_step == 0
                     and self.accelerator.is_main_process
                 ):
-                    plt_batch(
+                    image_array = plt_batch(
                         target_img,
                         raster_img,
                         self.step,
@@ -591,6 +591,9 @@ class VectorFusionPipeline(ModelState):
                         save_path=self.ft_png_logs_dir.as_posix(),
                         name=f"iter{self.step}",
                     )
+                    image = Image.fromarray(image_array)
+                    caption = f"step {self.step}"
+                    wandb.log({"image": wandb.Image(image, caption=caption)})
                     renderer.save_svg(self.ft_svg_logs_dir / f"svg_iter{self.step}.svg")
 
                 self.step += 1
