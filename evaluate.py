@@ -69,6 +69,7 @@ def change_args_for_generation(args):
 
     args.use_wandb = False
     args.negative_prompt = None
+    args.save_step = args.sds.num_iter
     return args
 
 def evaluate(args):
