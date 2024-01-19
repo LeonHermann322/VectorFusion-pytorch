@@ -639,6 +639,14 @@ class VectorFusionPipeline(ModelState):
                         name=f"iter{self.step}",
                     )
                     renderer.save_svg(self.ft_svg_logs_dir / f"svg_iter{self.step}.svg")
+                    #log clip score
+                    if self.args.log_clip:
+                        final_raster_img = renderer.get_image(self.step)
+                        clip_score  = get_clip_score(text_prompt,ToPILImage()(final_raster_img.squeeze()),self.device)
+                        print(clip_score)
+                        if self.args.use_wandb:
+                            wandb.log({"clipScore":clip_score})
+                    
 
                 self.step += 1
                 pbar.update(1)
