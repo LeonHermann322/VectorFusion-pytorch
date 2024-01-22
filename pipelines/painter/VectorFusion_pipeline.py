@@ -579,7 +579,6 @@ class VectorFusionPipeline(ModelState):
                 loss = L_sds + L_add + l_percep + total_visual_loss
                 
                 if self.args.use_wandb:
-
                     wandb.log(
                         {
                             "L_total": loss.item(), 
@@ -639,7 +638,8 @@ class VectorFusionPipeline(ModelState):
                     )
                     image = Image.fromarray(image_array)
                     caption = f"step {self.step}"
-                    wandb.log({"image": wandb.Image(image, caption=caption)})
+                    if self.args.use_wandb:
+                        wandb.log({"image": wandb.Image(image, caption=caption)})
                     renderer.save_svg(self.ft_svg_logs_dir / f"svg_iter{self.step}.svg")
                     #log clip score
                     if self.args.log_clip:
