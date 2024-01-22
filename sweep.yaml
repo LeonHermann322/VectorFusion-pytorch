@@ -1,7 +1,7 @@
 program: run_painterly_render.py 
 method: bayes
 metric:
-  name: L_total
+  name: clip_score
   goal: minimize
 parameters:
   image_size:
@@ -31,9 +31,10 @@ parameters:
   sds.num_iter: 
     values: [50]
   clip.vis_loss:
-    values: [0, 1]
+    min: 0
+    max: 100
   perceptual.coeff:
-    min: 1
+    min: 0
     max: 100
   softmax_temp:
     min: 0.0
