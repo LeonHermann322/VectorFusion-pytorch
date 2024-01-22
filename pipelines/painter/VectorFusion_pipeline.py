@@ -697,7 +697,7 @@ class VectorFusionPipeline(ModelState):
     def extract_ldm_attn(self, prompts):
         print("\n\nextract_ldm_attn with k sampling\n\n")
         # init controller
-        controller = AttentionStore() if self.args.attention_init else EmptyControl()
+        controller = AttentionStore() if self.args.coord_init == "attention" else EmptyControl()
         
         cross_attention_outputs = []
         self_attention_comp_outputs = []
