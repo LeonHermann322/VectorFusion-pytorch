@@ -163,3 +163,4 @@ lightning_logs/*
 
 # wandb
 wandb
+output.txt

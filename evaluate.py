@@ -82,7 +82,7 @@ def evaluate(args):
     
     #init wandb 
     if args.use_wandb:
-        wandb.init(entity="aiis-chair")
+        wandb.init()
     
     total_log= TimeLogger(name="total",use_wandb=args.use_wandb)
     

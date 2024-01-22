@@ -40,7 +40,7 @@ def render_batch_wrap(args: omegaconf.DictConfig,
 
 def main(args, seed_range):
     
-    wandb.init(entity="aiis-chair")
+    wandb.init()
     args.batch_size = 1  # rendering one SVG at a time
 
     render_batch_fn = partial(render_batch_wrap, args=args, seed_range=seed_range)
