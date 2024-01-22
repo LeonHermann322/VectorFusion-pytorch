@@ -53,6 +53,7 @@ class LSDSPipeline(StableDiffusionPipeline):
     def __call__(
         self,
         prompt: Union[str, List[str]],
+        embedding: Optional[torch.FloatTensor] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         controller: AttentionStore = EmptyControl(),  # feed attention_store as control of ptp
@@ -139,15 +140,17 @@ class LSDSPipeline(StableDiffusionPipeline):
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
-
-        # 3. Encode input prompt
-        text_embeddings = self._encode_prompt(
-            prompt,
-            device,
-            num_images_per_prompt,
-            do_classifier_free_guidance,
-            negative_prompt,
-        )
+        if embedding is None:
+            # 3. Encode input prompt
+            text_embeddings = self._encode_prompt(
+                prompt,
+                device,
+                num_images_per_prompt,
+                do_classifier_free_guidance,
+                negative_prompt,
+            )
+        else:
+            text_embeddings = embedding
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -226,11 +229,14 @@ class LSDSPipeline(StableDiffusionPipeline):
         # 10. Convert to PIL
         if output_type == "pil":
             image = self.numpy_to_pil(image)
-        elif output_type == "latents":
-            image = latents
 
         if not return_dict:
-            return (image, has_nsfw_concept)
+            if output_type == "latents":
+                return (latents, has_nsfw_concept)
+            if output_type == "pil":
+                return (image, has_nsfw_concept)
+            if output_type == "pil+latents":
+                return (image, latents, has_nsfw_concept)
 
         return StableDiffusionPipelineOutput(
             images=image, nsfw_content_detected=has_nsfw_concept

@@ -92,4 +92,6 @@ u2net_path: "./checkpoint/u2net/u2net.pth"
 # Reverse diffusion and prompt
 reverse_diffusion_mode: "finetuning" # Choices: "sampling", "finetuning", "none"
 reverse_diffusion_embedding_mode: "interpolate" # Choices: "hard_cut", "interpolated", is only evaluated if mode is finetuning
-attribute_importance: 0.3 # should be between 0.0 and 1.0
+attribute_importance: 1.0 # should be between 0.0 and 1.0
+beta: 1.0
+lambda_lr: 0.01

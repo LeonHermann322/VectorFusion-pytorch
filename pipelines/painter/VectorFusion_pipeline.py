@@ -231,35 +231,112 @@ class VectorFusionPipeline(ModelState):
         for i in range(self.args.K):
             height = width = model2res(self.args.model_id)
             if self.args.reverse_diffusion_mode == "sampling":
-                inf_steps_prompt = ceil(
-                    self.args.num_inference_steps * self.args.attribute_importance
-                )
-                inf_steps_attr = self.args.num_inference_steps - inf_steps_prompt
-                latents, _ = self.diffusion(
-                    prompt=[text_prompt],
-                    negative_prompt=self.args.negative_prompt,
-                    height=height,
-                    width=width,
-                    controller=EmptyControl(),
-                    num_images_per_prompt=1,
-                    num_inference_steps=inf_steps_prompt,
-                    guidance_scale=self.args.guidance_scale,
-                    output_type="latents",
-                    return_dict=False,
-                    generator=self.g_device,
-                )
-                outputs = self.diffusion(
-                    prompt=[attribute],
-                    negative_prompt=self.args.negative_prompt,
-                    height=height,
-                    width=width,
-                    controller=EmptyControl(),
-                    latents=latents,
-                    num_images_per_prompt=1,
-                    num_inference_steps=inf_steps_attr,
-                    guidance_scale=self.args.guidance_scale,
-                    generator=self.g_device,
-                )
+                if self.args.reverse_diffusion_embedding_mode == "hardcut":
+                    inf_steps_prompt = ceil(
+                        self.args.num_inference_steps * self.args.attribute_importance
+                    )
+                    inf_steps_attr = self.args.num_inference_steps - inf_steps_prompt
+                    latents, _ = self.diffusion(
+                        prompt=[text_prompt],
+                        negative_prompt=self.args.negative_prompt,
+                        height=height,
+                        width=width,
+                        controller=EmptyControl(),
+                        num_images_per_prompt=1,
+                        num_inference_steps=inf_steps_prompt,
+                        guidance_scale=self.args.guidance_scale,
+                        output_type="latents",
+                        return_dict=False,
+                        generator=self.g_device,
+                    )
+                    outputs = self.diffusion(
+                        prompt=[attribute],
+                        negative_prompt=self.args.negative_prompt,
+                        height=height,
+                        width=width,
+                        controller=EmptyControl(),
+                        latents=latents,
+                        num_images_per_prompt=1,
+                        num_inference_steps=inf_steps_attr,
+                        guidance_scale=self.args.guidance_scale,
+                        generator=self.g_device,
+                    )
+                else:
+                    lambda_coeff = torch.nn.Parameter(torch.rand(1), requires_grad=True)
+                    prompt_emb = self.diffusion._encode_prompt(
+                        text_prompt,
+                        num_images_per_prompt=1,
+                        do_classifier_free_guidance=self.args.guidance_scale > 1.0,
+                    )
+                    attribute_emb = self.diffusion._encode_prompt(
+                        attribute,
+                        num_images_per_prompt=1,
+                        do_classifier_free_guidance=self.args.guidance_scale > 1.0,
+                    )
+
+                    # Original creation without attribute
+                    prompt_img = [np.array(img) for img in outputs.images][0]
+
+                    optimizer = torch.optim.SGD([lambda_coeff], lr=self.args.lambda_lr)
+
+                    # Optimize lambda_coeff for:
+                    #   1. Semantic similarity compared to original image (Perceptual loss)
+                    #   2. Style conformity of image in respect to attribute embedding (CLIP directional loss)
+                    for i in range(self.args.num_inference_steps):
+                        # Interpolated embedding
+                        inp_emb = (
+                            1.0 - lambda_coeff
+                        ) * prompt_emb + lambda_coeff * attribute_emb
+
+                        # Single inference step
+                        img, latents, _ = self.diffusion(
+                            embedding=inp_emb,
+                            height=height,
+                            width=width,
+                            controller=EmptyControl(),
+                            num_images_per_prompt=1,
+                            num_inference_steps=inf_steps_prompt,
+                            guidance_scale=self.args.guidance_scale,
+                            output_type="pil+latents",
+                            return_dict=False,
+                            generator=self.g_device,
+                        )
+
+                        perceptual_loss_fn = partial(
+                            self.lpips_loss_fn.forward,
+                            return_per_layer=False,
+                            normalize=False,
+                        )
+                        l_perceptual = perceptual_loss_fn(prompt_img, img).mean()
+
+                        l_clip_directional = self.clip_score_fn.directional_loss(
+                            src_text=text_prompt,
+                            src_img=prompt_img,
+                            tar_text=attribute,
+                            tar_img=img,
+                        )
+
+                        # Update lambda_coeff
+                        loss = l_clip_directional + self.args.beta * l_perceptual
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        
+                    inp_emb = (
+                            1.0 - lambda_coeff
+                        ) * prompt_emb + lambda_coeff * attribute_emb
+
+                    outputs = self.diffusion(
+                        embedding=inp_emb,
+                        height=height,
+                        width=width,
+                        controller=EmptyControl(),
+                        latents=latents,
+                        num_images_per_prompt=1,
+                        num_inference_steps=inf_steps_attr,
+                        guidance_scale=self.args.guidance_scale,
+                        generator=self.g_device,
+                    )
             else:
                 outputs = self.diffusion(
                     prompt=[text_prompt],
