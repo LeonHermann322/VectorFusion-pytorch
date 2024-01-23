@@ -10,10 +10,12 @@ import argparse
 from datetime import datetime
 import random
 import ast
+import wandb
 from typing import Any, List
 from functools import partial
 
 from accelerate.utils import set_seed
+from methods.painter.vectorfusion.utils import TimeLogger
 import omegaconf
 
 sys.path.append(os.path.split(os.path.abspath(os.path.dirname(__file__)))[0])
@@ -37,6 +39,10 @@ def render_batch_wrap(args: omegaconf.DictConfig,
 
 
 def main(args, seed_range):
+    
+    if args.use_wandb:
+        wandb.init()
+
     args.batch_size = 1  # rendering one SVG at a time
 
     render_batch_fn = partial(render_batch_wrap, args=args, seed_range=seed_range)
@@ -47,13 +53,22 @@ def main(args, seed_range):
         args.schedule_each = ast.literal_eval(args.schedule_each)
     if not isinstance(args.sds.t_range, omegaconf.ListConfig):
         args.sds.t_range = ast.literal_eval(args.sds.t_range)
-
+    
+    total_log= TimeLogger(name="total",use_wandb=args.use_wandb)
     if not args.render_batch:
+        init_log= TimeLogger(name="init",use_wandb=args.use_wandb)
         pipe = VectorFusionPipeline(args)
+        
+        init_log.finish()
+        
+        paint_log = TimeLogger(name="paint",use_wandb=args.use_wandb)
         pipe.painterly_rendering(args.prompt)
+        paint_log.finish()
     else:  # generate many SVG at once
         render_batch_fn(pipeline=VectorFusionPipeline, text_prompt=args.prompt)
-        
+    
+    total_log.finish()
+    
     return True
 
 

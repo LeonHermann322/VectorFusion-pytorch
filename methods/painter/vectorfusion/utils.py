@@ -13,6 +13,8 @@ from PIL import Image
 import torch
 from torchvision.utils import make_grid
 
+import time 
+import wandb
 
 def plt_batch(
         photos: torch.Tensor,
@@ -117,3 +119,21 @@ def view_images(images: Union[np.ndarray, List],
     if save_image:
         pil_img.save(fp)
     return pil_img
+
+class TimeLogger():
+    
+    def __init__(self,name:str,use_wandb:bool):
+        self.name = name
+        self.use_wandb = use_wandb
+        self.init_time = time.time()
+        
+    
+    def finish(self):
+        
+        init_time_end = time.time()
+        init_time = init_time_end - self.init_time
+        if self.use_wandb:
+            wandb.log({self.name+"_time":init_time})
+        print(self.name+f"_time: {init_time} seconds")
+        
+        del self

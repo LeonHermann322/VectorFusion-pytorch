@@ -15,11 +15,10 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 from torchvision import transforms
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
-from DiffSketcher.methods.token2attn.attn_control import EmptyControl
 
+from methods.token2attn.attn_control import EmptyControl, AttentionStore
 
-from DiffSketcher.methods.token2attn.attn_control import AttentionStore
-from DiffSketcher.methods.token2attn.ptp_utils import text_under_image, view_images
+from methods.token2attn.ptp_utils import text_under_image, view_images
 
 
 class LSDSPipeline(StableDiffusionPipeline):
@@ -585,5 +584,5 @@ class SpecifyGradient(torch.autograd.Function):
     def backward(ctx, grad_scale):
         (gt_grad,) = ctx.saved_tensors
         gt_grad = gt_grad * grad_scale
-        wandb.log({"gt_grad":gt_grad, "gt_grad mean": gt_grad.mean()})
+        # wandb.log({"gt_grad":gt_grad, "gt_grad mean": gt_grad.mean()})
         return gt_grad, None
