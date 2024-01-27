@@ -13,7 +13,6 @@ from skimage.color import rgb2gray
 
 from torchvision.datasets.folder import is_image_file
 from torchvision.transforms import ToPILImage
-
 from omegaconf.listconfig import ListConfig
 import diffusers
 import numpy as np
@@ -44,7 +43,7 @@ from diffusers import StableDiffusionPipeline
 from methods.diffvg_warp import init_diffvg
 from DiffSketcher.methods.token2attn.attn_control import AttentionStore, EmptyControl
 
-
+from create_gif import create_gif_from_svgs
 
 def get_clip_score(prompt,img,device):  # local import
         print("todo: use batch")
@@ -670,7 +669,8 @@ class VectorFusionPipeline(ModelState):
             print(final_svg_fpth)
             renderer.save_svg(final_svg_fpth)
             
-            
+        #create gif of logs 
+        create_gif_from_svgs(self.ft_svg_logs_dir,self.results_path)
 
         self.close(msg="painterly rendering complete.")
 
