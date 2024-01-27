@@ -60,7 +60,7 @@ class VectorFusionPipeline(ModelState):
             f"{formatted_date_time}" )
         super().__init__(args, log_path_suffix=logdir_)
 
-        wandb.init(entity="aiis-chair",group="guidanceScale")
+        wandb.init(entity="aiis-chair-students",group="guidanceScale")
 
         assert args.style in ["iconography", "pixelart", "sketch"]
 
@@ -613,6 +613,7 @@ class VectorFusionPipeline(ModelState):
                            self.args.train_stroke,
                            self.args.width,
                            path_svg=path_svg,
+                           freeze_svg=self.args.freeze_svg,
                             device=self.device,
                             attention_map=attention_map,
                             softmax_temp=self.args.softmax_temp, 

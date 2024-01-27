@@ -1,6 +1,7 @@
 seed: 1
 image_size: 600
 path_svg: ~  # if you want to load a svg file and train from it
+freeze_svg: False
 skip_live: False
 style: "iconography" # "pixelart", "sketch"
 
@@ -26,7 +27,7 @@ width: 3 # stroke width
 num_segments: 4
 segment_init: 'circle' # 'random'
 radius: 20
-coord_init: 'attention' # 'random', 'naive', place the first control point
+coord_init: 'sparse' # 'attention', 'random', 'naive', place the first control point
 grid: 32 # divide the canvas into n grids
 path_reinit: # reinitializing paths
   use: True

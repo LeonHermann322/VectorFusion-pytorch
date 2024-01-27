@@ -33,6 +33,7 @@ class Painter(nn.Module):
             stroke: bool = False,
             stroke_width: int = 3,
             path_svg=None,
+            freeze_svg=False,
             device=None,
             attention_map =None,
             softmax_temp = None,
@@ -72,6 +73,7 @@ class Painter(nn.Module):
         self.stroke_color_vars = []
 
         self.path_svg = path_svg
+        self.freeze_svg = freeze_svg
         self.optimize_flag = []
 
         self.strokes_counter = 0  # counts the number of calls to "get_path"
@@ -185,20 +187,21 @@ class Painter(nn.Module):
                 self.canvas_width, self.canvas_height, self.shapes, self.shape_groups = self.load_svg(self.path_svg)
                 # if you want to add more strokes to existing ones and optimize on all of them
                 num_paths_exists = len(self.shapes)
-
                 self.cur_shapes = self.shapes
                 self.cur_shape_groups = self.shape_groups
-
+                for shape_group in self.cur_shape_groups:
+                    shape_group.fill_color.requires_grad = False
+                for shape in self.cur_shapes:
+                    shape.points.requires_grad = False
             for i in range(num_paths_exists, num_paths):
                 if self.style == 'iconography':
                     path = self.get_path()
                     self.shapes.append(path)
-                    self.cur_shapes.append(path)
 
                     wref, href = self.color_ref
                     wref = max(0, min(int(wref), self.canvas_width - 1))
                     href = max(0, min(int(href), self.canvas_height - 1))
-                    fill_color_init = list(self.target_img[0, :, href, wref]) + [1.]
+                    fill_color_init = list(self.target_img[0, :, href, wref]) + [0.25]
                     fill_color_init = torch.FloatTensor(fill_color_init)
                     stroke_color_init = torch.FloatTensor(np.random.uniform(size=[4]))
                     path_group = pydiffvg.ShapeGroup(
@@ -207,7 +210,6 @@ class Painter(nn.Module):
                         stroke_color=stroke_color_init if self.train_stroke else None
                     )
                     self.shape_groups.append(path_group)
-                    self.cur_shape_groups.append(path_group)
 
                 elif self.style == 'pixelart':
                     for j in range(num_paths):
@@ -239,8 +241,10 @@ class Painter(nn.Module):
                     )
                     self.shape_groups.append(path_group)
                     self.cur_shape_groups.append(path_group)
-
-            self.optimize_flag = [True for i in range(len(self.shapes))]
+            self.cur_shapes = self.shapes
+            self.cur_shape_groups = self.shape_groups
+            length = (len(self.shapes) // 2) if self.freeze_svg else len(self.shapes)
+            self.optimize_flag = [False] * length + [True] * (len(self.shapes) - length)
 
         img = self.render_warp()
         img = img[:, :, 3:4] * img[:, :, :3] + self.para_bg * (1 - img[:, :, 3:4])
@@ -465,24 +469,28 @@ class Painter(nn.Module):
         self.stroke_width_vars = []
         for i, path in enumerate(self.cur_shapes):
             path.id = i + id_delta  # set point id
-            path.points.requires_grad = True
-            self.points_vars.append(path.points)
+            if(self.optimize_flag[i]):
+                path.points.requires_grad = True
+                self.points_vars.append(path.points)
 
-            if self.train_stroke:
-                path.stroke_width.requires_grad = True
-                self.stroke_width_vars.append(path.stroke_width)
+                if self.train_stroke:
+                    path.stroke_width.requires_grad = True
+                    self.stroke_width_vars.append(path.stroke_width)
+
 
     def set_color_parameters(self):
         # for stroke' color optimization
         self.color_vars = []
         self.stroke_color_vars = []
+        true_index = self.optimize_flag.index(True)
         for i, group in enumerate(self.cur_shape_groups):
-            group.fill_color.requires_grad = True
-            self.color_vars.append(group.fill_color)
+            if(any(self.optimize_flag(shape_id) >= true_index) for shape_id in group.shape_ids):
+                group.fill_color.requires_grad = True
+                self.color_vars.append(group.fill_color)
 
-            if self.train_stroke:
-                group.stroke_color.requires_grad = True
-                self.stroke_color_vars.append(group.stroke_color)
+                if self.train_stroke:
+                    group.stroke_color.requires_grad = True
+                    self.stroke_color_vars.append(group.stroke_color)
 
     def get_point_parameters(self):
         return self.points_vars
