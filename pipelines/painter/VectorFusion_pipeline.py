@@ -6,9 +6,10 @@
 import datetime
 from functools import partial
 from PIL import Image
-from typing import Union, AnyStr, List
+from typing import Literal, Union, AnyStr, List
 from skimage.color import rgb2gray
 from math import ceil
+from PIL import Image
 
 from torchvision.datasets.folder import is_image_file
 
@@ -20,6 +21,8 @@ import torch
 import torch.nn.functional as F
 from torchvision import transforms
 import wandb
+
+from diffusers.utils.torch_utils import randn_tensor
 
 from DiffSketcher.libs.metric.lpips_origin.lpips import LPIPS
 from DiffSketcher.libs.metric.clip_score.openaiCLIP_loss import CLIPScoreWrapper
@@ -225,134 +228,323 @@ class VectorFusionPipeline(ModelState):
         selected_image = diffusion_samples[selected_image_index]
         return selected_image, selected_image_index
 
+    def get_clip_text_embeddings(
+        self, text_prompt: str, attribute: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prompt_emb = self.clip_score_fn.encode_text(text_prompt).cuda()
+        attribute_emb = self.clip_score_fn.encode_text(attribute).cuda()
+        return prompt_emb, attribute_emb
+
+    def get_diffusion_text_embeddings(
+        self, text_prompt: str, attribute: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prompt_emb = self.diffusion._encode_prompt(
+            text_prompt,
+            num_images_per_prompt=1,
+            device=self.diffusion._execution_device,
+            do_classifier_free_guidance=self.args.guidance_scale > 1.0,
+        ).cuda()
+        attribute_emb = self.diffusion._encode_prompt(
+            attribute,
+            num_images_per_prompt=1,
+            device=self.diffusion._execution_device,
+            do_classifier_free_guidance=self.args.guidance_scale > 1.0,
+        ).cuda()
+        return prompt_emb, attribute_emb
+
+    def sample_diffusion_model(
+        self,
+        input: torch.Tensor | str,
+        inference_steps: int,
+        latents: torch.Tensor | None = None,
+        return_type: Literal["pil", "latents", "pil+latents"] | None = None,
+        return_dict: bool = False,
+        seed=None,
+    ):
+        height = width = model2res(self.args.model_id)
+        if type(input) is str:
+            return self.diffusion(
+                prompt=input,
+                negative_prompt=self.args.negative_prompt,
+                height=height,
+                width=width,
+                controller=EmptyControl(),
+                latents=latents,
+                num_images_per_prompt=1,
+                num_inference_steps=inference_steps,
+                guidance_scale=self.args.guidance_scale,
+                output_type=return_type,
+                return_dict=return_dict,
+                generator=self.g_device,
+            )
+        else:
+            return self.diffusion(
+                "",
+                embedding=input,
+                height=height,
+                width=width,
+                controller=EmptyControl(),
+                latents=latents,
+                num_images_per_prompt=1,
+                num_inference_steps=inference_steps,
+                guidance_scale=self.args.guidance_scale,
+                output_type=return_type,
+                return_dict=return_dict,
+                generator=self.g_device,
+            )
+
+    def get_clip_image_embedding(self, image):
+        self.clip_score_fn = self.clip_score_fn.cpu()
+        preprocess_img = self.clip_score_fn.preprocess(image).unsqueeze(0)
+        encoded_img = self.clip_score_fn.encode_image(preprocess_img)
+        return encoded_img
+
+    def latent_initialization(self, dtype):
+        height = width = model2res(self.args.model_id)
+        try:
+            num_channels_latents = self.diffusion.unet.config.in_channels
+        except Exception or Warning:
+            num_channels_latents = self.diffusion.unet.in_channels
+        latents_shape = (
+            1,
+            num_channels_latents,
+            height // self.diffusion.vae_scale_factor,
+            width // self.diffusion.vae_scale_factor,
+        )
+        latents = randn_tensor(
+            shape=latents_shape, device=self.diffusion._execution_device, dtype=dtype
+        )
+        return latents
+
     def diffusion_sampling(self, text_prompt: AnyStr, attribute: AnyStr | None = None):
         """sampling K images"""
         diffusion_samples = []
         for i in range(self.args.K):
-            height = width = model2res(self.args.model_id)
+            file_path = self.sd_sample_dir / f"samples_{i}.png"
             if self.args.reverse_diffusion_mode == "sampling":
                 if self.args.reverse_diffusion_embedding_mode == "hardcut":
                     inf_steps_prompt = ceil(
                         self.args.num_inference_steps * self.args.attribute_importance
                     )
                     inf_steps_attr = self.args.num_inference_steps - inf_steps_prompt
-                    latents, _ = self.diffusion(
-                        prompt=[text_prompt],
-                        negative_prompt=self.args.negative_prompt,
-                        height=height,
-                        width=width,
-                        controller=EmptyControl(),
-                        num_images_per_prompt=1,
-                        num_inference_steps=inf_steps_prompt,
-                        guidance_scale=self.args.guidance_scale,
-                        output_type="latents",
-                        return_dict=False,
-                        generator=self.g_device,
+
+                    latents, _ = self.sample_diffusion_model(
+                        input=text_prompt,
+                        inference_steps=inf_steps_prompt,
+                        return_type="latents",
                     )
-                    outputs = self.diffusion(
-                        prompt=[attribute],
-                        negative_prompt=self.args.negative_prompt,
-                        height=height,
-                        width=width,
-                        controller=EmptyControl(),
-                        latents=latents,
-                        num_images_per_prompt=1,
-                        num_inference_steps=inf_steps_attr,
-                        guidance_scale=self.args.guidance_scale,
-                        generator=self.g_device,
+                    outputs = self.sample_diffusion_model(
+                        input=attribute, inference_steps=inf_steps_attr, latents=latents
                     )
                 else:
-                    lambda_coeff = torch.nn.Parameter(torch.rand(1), requires_grad=True)
-                    prompt_emb = self.diffusion._encode_prompt(
-                        text_prompt,
-                        num_images_per_prompt=1,
-                        do_classifier_free_guidance=self.args.guidance_scale > 1.0,
+                    # with torch.set_grad_enabled(True):
+                    # Lambda_coeff controls blending of prompt and attribute
+                    """lambda_coeff = torch.nn.Parameter(
+                        torch.rand(1, requires_grad=True).cuda(), requires_grad=True
                     )
-                    attribute_emb = self.diffusion._encode_prompt(
-                        attribute,
-                        num_images_per_prompt=1,
-                        do_classifier_free_guidance=self.args.guidance_scale > 1.0,
-                    )
+                    lambda_coeff.retain_grad()"""
 
+                    # Encoding text input for diffusion model and CLIP loss
+                    (
+                        prompt_emb_diffusion,
+                        attribute_emb_diffusion,
+                    ) = self.get_diffusion_text_embeddings(text_prompt, attribute)
+                    (
+                        prompt_emb_clip,
+                        attribute_emb_clip,
+                    ) = self.get_clip_text_embeddings(text_prompt, attribute)
+
+                    init_latents = self.latent_initialization(
+                        prompt_emb_diffusion.dtype
+                    )
                     # Original creation without attribute
-                    prompt_img = [np.array(img) for img in outputs.images][0]
+                    outputs = self.sample_diffusion_model(
+                        input=text_prompt,
+                        inference_steps=self.args.num_inference_steps,
+                        latents=init_latents,
+                        return_type="pil",
+                        return_dict=True,
+                    )
 
-                    optimizer = torch.optim.SGD([lambda_coeff], lr=self.args.lambda_lr)
+                    # Encode sample of prompt with clip
+                    self.clip_score_fn = self.clip_score_fn.cuda()
+                    orig_img_pil = outputs.images[0]
+
+                    outputs_np = [np.array(img) for img in outputs.images]
+                    view_images(
+                        outputs_np,
+                        save_image=True,
+                        fp=self.sd_sample_dir / f"samples_{i}_no_attr.png",
+                    )
+
+                    enc_orig_img = self.clip_score_fn.encode_image(
+                        self.clip_score_fn.preprocess(
+                            # torch.from_numpy(np.array(sample)).cpu()
+                            orig_img_pil
+                        )
+                        .cuda()
+                        .unsqueeze(0)
+                    )
+
+                    """ optimizer = torch.optim.Adam(
+                        [lambda_coeff], lr=self.args.lambda_lr
+                    )
+                    optimizer.zero_grad(set_to_none=False) """
 
                     # Optimize lambda_coeff for:
                     #   1. Semantic similarity compared to original image (Perceptual loss)
                     #   2. Style conformity of image in respect to attribute embedding (CLIP directional loss)
-                    for i in range(self.args.num_inference_steps):
-                        # Interpolated embedding
+                    losses = []
+                    outputs_array = []
+                    for step in range(1, int(1.0 / self.args.lambda_step_size)):
+                        lambda_coeff = torch.tensor(
+                            data=[self.args.lambda_step_size * step]
+                        ).cuda()
                         inp_emb = (
-                            1.0 - lambda_coeff
-                        ) * prompt_emb + lambda_coeff * attribute_emb
-
-                        # Single inference step
-                        img, latents, _ = self.diffusion(
-                            embedding=inp_emb,
-                            height=height,
-                            width=width,
-                            controller=EmptyControl(),
-                            num_images_per_prompt=1,
-                            num_inference_steps=inf_steps_prompt,
-                            guidance_scale=self.args.guidance_scale,
-                            output_type="pil+latents",
-                            return_dict=False,
-                            generator=self.g_device,
+                            (1.0 - lambda_coeff) * prompt_emb_diffusion
+                            + lambda_coeff * attribute_emb_diffusion
                         )
+                        outputs = self.sample_diffusion_model(
+                            input=inp_emb,
+                            inference_steps=self.args.num_inference_steps,
+                            latents=init_latents,
+                            return_type="pil",
+                            return_dict=True,
+                        )
+                        img = outputs.images[0]
 
+                        # Encoding image with CLIP
+                        finetune_img = (
+                            self.clip_score_fn.preprocess(img).cuda().unsqueeze(0)
+                        )
+                        enc_finetune_img = self.clip_score_fn.encode_image(finetune_img)
+
+                        # Checking semantic change in the image
                         perceptual_loss_fn = partial(
                             self.lpips_loss_fn.forward,
                             return_per_layer=False,
                             normalize=False,
                         )
-                        l_perceptual = perceptual_loss_fn(prompt_img, img).mean()
+                        l_perceptual = perceptual_loss_fn(
+                            torch.from_numpy(np.array(orig_img_pil))
+                            .cuda()
+                            .permute(2, 0, 1)
+                            .unsqueeze(0),
+                            torch.from_numpy(np.array(img))
+                            .cuda()
+                            .permute(2, 0, 1)
+                            .unsqueeze(0),
+                        ).mean()
 
+                        # Directional loss with current denoised image
                         l_clip_directional = self.clip_score_fn.directional_loss(
-                            src_text=text_prompt,
-                            src_img=prompt_img,
-                            tar_text=attribute,
-                            tar_img=img,
+                            src_text=prompt_emb_clip,
+                            src_img=enc_orig_img,
+                            tar_text=attribute_emb_clip,
+                            tar_img=enc_finetune_img,
                         )
 
                         # Update lambda_coeff
                         loss = l_clip_directional + self.args.beta * l_perceptual
-                        optimizer.zero_grad()
-                        loss.backward()
+
+                        print(
+                            f"{i} Iteration: lambda = {lambda_coeff.item()}, loss = {loss.item()}, clip directional = {l_clip_directional.item()}, perceptual = {l_perceptual}"
+                        )
+
+                        losses.append(loss.item())
+                        outputs_array.append(outputs)
+
+                    """ initial_img, initial_latents, _ = self.sample_diffusion_model(
+                        input=text_prompt,
+                        inference_steps=1,
+                        return_type="pil+latents",
+                    )
+                    latents_arr = [initial_latents]
+                    img_arr = [initial_img[0]]
+                    for i in range(self.args.num_inference_steps - 2):
+                        optimizer.zero_grad(set_to_none=False)
+
+                        print(lambda_coeff.item())
+                        # Interpolated embedding
+                        inp_emb = (
+                            (1.0 - lambda_coeff) * prompt_emb_diffusion
+                            + lambda_coeff * attribute_emb_diffusion
+                        )
+
+                        # Single inference step with latents and blended text embedding
+                        output_tuple = self.sample_diffusion_model(
+                            input=inp_emb,
+                            inference_steps=1,
+                            latents=latents_arr[-1],
+                            return_type="pil+latents",
+                        )
+                        img_arr.append(output_tuple[0][0])
+                        latents_arr.append(output_tuple[1])
+
+                        # Encoding image with CLIP
+                        finetune_img = (
+                            self.clip_score_fn.preprocess(img_arr[-1])
+                            .cuda()
+                            .unsqueeze(0)
+                        )
+                        enc_finetune_img = self.clip_score_fn.encode_image(
+                            finetune_img
+                        )
+
+                        # Checking semantic change in the image
+                        perceptual_loss_fn = partial(
+                            self.lpips_loss_fn.forward,
+                            return_per_layer=False,
+                            normalize=False,
+                        )
+                        l_perceptual = perceptual_loss_fn(
+                            torch.from_numpy(np.array(orig_img_pil))
+                            .cuda()
+                            .permute(2, 0, 1)
+                            .unsqueeze(0),
+                            torch.from_numpy(np.array(img_arr[-1]))
+                            .cuda()
+                            .permute(2, 0, 1)
+                            .unsqueeze(0),
+                        ).mean()
+
+                        # Directional loss with current denoised image
+                        l_clip_directional = self.clip_score_fn.directional_loss(
+                            src_text=prompt_emb_clip,
+                            src_img=enc_orig_img,
+                            tar_text=attribute_emb_clip,
+                            tar_img=enc_finetune_img,
+                        )
+
+                        # Update lambda_coeff
+                        loss = l_clip_directional + self.args.beta * l_perceptual
+
+                        loss.backward(retain_graph=True)
                         optimizer.step()
 
-                    inp_emb = (
-                        1.0 - lambda_coeff
-                    ) * prompt_emb + lambda_coeff * attribute_emb
-
-                    outputs = self.diffusion(
-                        embedding=inp_emb,
-                        height=height,
-                        width=width,
-                        controller=EmptyControl(),
-                        latents=latents,
-                        num_images_per_prompt=1,
-                        num_inference_steps=inf_steps_attr,
-                        guidance_scale=self.args.guidance_scale,
-                        generator=self.g_device,
+                inp_emb = (
+                    (1.0 - lambda_coeff) * prompt_emb_diffusion
+                    + lambda_coeff * attribute_emb_diffusion
+                )
+                outputs = self.sample_diffusion_model(
+                    input=inp_emb,
+                    inference_steps=1,
+                    latents=latents,
+                    return_type="pil",
+                    return_dict=True,
+                ) """
+                    min_loss_idx = np.argmin(losses)
+                    file_path = (
+                        self.sd_sample_dir
+                        / f"samples_{i}_{(min_loss_idx + 1) * self.args.lambda_step_size}.png"
                     )
+                    outputs = outputs_array[min_loss_idx]
             else:
-                outputs = self.diffusion(
-                    prompt=[text_prompt],
-                    negative_prompt=self.args.negative_prompt,
-                    height=height,
-                    width=width,
-                    controller=EmptyControl(),
-                    num_images_per_prompt=1,
-                    num_inference_steps=self.args.num_inference_steps,
-                    guidance_scale=self.args.guidance_scale,
-                    generator=self.g_device,
+                outputs = self.sample_diffusion_model(
+                    input=text_prompt, inference_steps=self.args.num_inference_steps
                 )
             outputs_np = [np.array(img) for img in outputs.images]
-            view_images(
-                outputs_np, save_image=True, fp=self.sd_sample_dir / f"samples_{i}.png"
-            )
+            view_images(outputs_np, save_image=True, fp=file_path)
             diffusion_samples.extend(outputs.images)
 
         self.print(

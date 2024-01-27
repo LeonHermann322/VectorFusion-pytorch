@@ -227,7 +227,7 @@ class LSDSPipeline(StableDiffusionPipeline):
         # image, has_nsfw_concept = self.run_safety_checker(image, device, text_embeddings.dtype)
 
         # 10. Convert to PIL
-        if output_type == "pil":
+        if output_type == "pil" or output_type == "pil+latents":
             image = self.numpy_to_pil(image)
 
         if not return_dict:
