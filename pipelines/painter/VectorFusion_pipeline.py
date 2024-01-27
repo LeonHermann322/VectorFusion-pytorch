@@ -337,13 +337,6 @@ class VectorFusionPipeline(ModelState):
                         input=attribute, inference_steps=inf_steps_attr, latents=latents
                     )
                 else:
-                    # with torch.set_grad_enabled(True):
-                    # Lambda_coeff controls blending of prompt and attribute
-                    """lambda_coeff = torch.nn.Parameter(
-                        torch.rand(1, requires_grad=True).cuda(), requires_grad=True
-                    )
-                    lambda_coeff.retain_grad()"""
-
                     # Encoding text input for diffusion model and CLIP loss
                     (
                         prompt_emb_diffusion,
@@ -385,11 +378,6 @@ class VectorFusionPipeline(ModelState):
                         .cuda()
                         .unsqueeze(0)
                     )
-
-                    """ optimizer = torch.optim.Adam(
-                        [lambda_coeff], lr=self.args.lambda_lr
-                    )
-                    optimizer.zero_grad(set_to_none=False) """
 
                     # Optimize lambda_coeff for:
                     #   1. Semantic similarity compared to original image (Perceptual loss)
@@ -454,85 +442,6 @@ class VectorFusionPipeline(ModelState):
                         losses.append(loss.item())
                         outputs_array.append(outputs)
 
-                    """ initial_img, initial_latents, _ = self.sample_diffusion_model(
-                        input=text_prompt,
-                        inference_steps=1,
-                        return_type="pil+latents",
-                    )
-                    latents_arr = [initial_latents]
-                    img_arr = [initial_img[0]]
-                    for i in range(self.args.num_inference_steps - 2):
-                        optimizer.zero_grad(set_to_none=False)
-
-                        print(lambda_coeff.item())
-                        # Interpolated embedding
-                        inp_emb = (
-                            (1.0 - lambda_coeff) * prompt_emb_diffusion
-                            + lambda_coeff * attribute_emb_diffusion
-                        )
-
-                        # Single inference step with latents and blended text embedding
-                        output_tuple = self.sample_diffusion_model(
-                            input=inp_emb,
-                            inference_steps=1,
-                            latents=latents_arr[-1],
-                            return_type="pil+latents",
-                        )
-                        img_arr.append(output_tuple[0][0])
-                        latents_arr.append(output_tuple[1])
-
-                        # Encoding image with CLIP
-                        finetune_img = (
-                            self.clip_score_fn.preprocess(img_arr[-1])
-                            .cuda()
-                            .unsqueeze(0)
-                        )
-                        enc_finetune_img = self.clip_score_fn.encode_image(
-                            finetune_img
-                        )
-
-                        # Checking semantic change in the image
-                        perceptual_loss_fn = partial(
-                            self.lpips_loss_fn.forward,
-                            return_per_layer=False,
-                            normalize=False,
-                        )
-                        l_perceptual = perceptual_loss_fn(
-                            torch.from_numpy(np.array(orig_img_pil))
-                            .cuda()
-                            .permute(2, 0, 1)
-                            .unsqueeze(0),
-                            torch.from_numpy(np.array(img_arr[-1]))
-                            .cuda()
-                            .permute(2, 0, 1)
-                            .unsqueeze(0),
-                        ).mean()
-
-                        # Directional loss with current denoised image
-                        l_clip_directional = self.clip_score_fn.directional_loss(
-                            src_text=prompt_emb_clip,
-                            src_img=enc_orig_img,
-                            tar_text=attribute_emb_clip,
-                            tar_img=enc_finetune_img,
-                        )
-
-                        # Update lambda_coeff
-                        loss = l_clip_directional + self.args.beta * l_perceptual
-
-                        loss.backward(retain_graph=True)
-                        optimizer.step()
-
-                inp_emb = (
-                    (1.0 - lambda_coeff) * prompt_emb_diffusion
-                    + lambda_coeff * attribute_emb_diffusion
-                )
-                outputs = self.sample_diffusion_model(
-                    input=inp_emb,
-                    inference_steps=1,
-                    latents=latents,
-                    return_type="pil",
-                    return_dict=True,
-                ) """
                     min_loss_idx = np.argmin(losses)
                     file_path = (
                         self.sd_sample_dir
