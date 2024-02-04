@@ -42,7 +42,7 @@ enable_xformers: False
 gradient_checkpoint: False
 num_inference_steps: 50
 guidance_scale: 7.5 # sdxl default 5.0
-K: 20
+K: 6
 lora_path: ~
 
 # SDS
@@ -74,7 +74,7 @@ clip:
 perceptual:
   name: "lpips" # dists
   lpips_net: 'vgg'
-  coeff: 1.0
+  coeff: 0.2
   
 token_ind: 1 # the index of CLIP prompt embedding, start from 1, 0 is start token
 xdog_intersec: True # initialize along the edge, mix XDoG and attn up
