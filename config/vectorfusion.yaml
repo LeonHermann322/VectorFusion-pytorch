@@ -77,7 +77,6 @@ perceptual:
   coeff: 1.0
   
 token_ind: 1 # the index of CLIP prompt embedding, start from 1, 0 is start token
-attention_init: True # if True, use the attention heads of Dino model to set the location of the initial strokes
 xdog_intersec: True # initialize along the edge, mix XDoG and attn up
 softmax_temp: 0.5
 cross_attn_res: 16

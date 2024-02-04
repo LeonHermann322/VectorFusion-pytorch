@@ -4,6 +4,8 @@
 # Description:
 
 import datetime
+import wandb
+from methods.painter.vectorfusion.utils import TimeLogger
 from functools import partial
 from PIL import Image
 from typing import Literal, Union, AnyStr, List
@@ -12,15 +14,16 @@ from math import ceil
 from PIL import Image
 
 from torchvision.datasets.folder import is_image_file
-
+from torchvision.transforms import ToPILImage
 from omegaconf.listconfig import ListConfig
 import diffusers
 import numpy as np
 from tqdm.auto import tqdm
 import torch
 import torch.nn.functional as F
+
+import clip
 from torchvision import transforms
-import wandb
 
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -44,15 +47,37 @@ from diffusers import StableDiffusionPipeline
 from methods.diffvg_warp import init_diffvg
 from DiffSketcher.methods.token2attn.attn_control import AttentionStore, EmptyControl
 
+from create_gif import create_gif_from_svgs
+
+
+def get_clip_score(prompt, img, device):  # local import
+    print("todo: use batch")
+    clip_model, preprocess = clip.load("ViT-B/32", device=device)
+
+    text_input = clip.tokenize([prompt]).to(device)
+    text_features = clip_model.encode_text(text_input)
+    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+    clip_img = preprocess(img).unsqueeze(0).to(device)
+    image_features = clip_model.encode_image(clip_img)
+    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+    # clip score
+    similarity_score = (text_features @ image_features.T).squeeze(0)
+
+    return similarity_score[0].item()
+
 
 class VectorFusionPipeline(ModelState):
-    def __init__(self, args):
+    def __init__(self, args, eval_mode=False):
         now = datetime.datetime.now()
 
         # Format the date and time as a string, for example '2024-01-06_15-30-25'
         formatted_date_time = now.strftime("%Y-%m-%d_%H-%M-%S")
 
+        self.eval_mode = eval_mode
         # Your base file path or directory
+
         logdir_ = (
             f"{'scratch' if args.skip_live else 'baseline'}"
             f"-{args.model_id}"
@@ -61,11 +86,12 @@ class VectorFusionPipeline(ModelState):
             f"-im{args.image_size}"
             f"-P{args.num_paths}"
             f"{'-RePath' if args.path_reinit.use else ''}"
-            f"{formatted_date_time}"
+            # f"{formatted_date_time}"
         )
-        super().__init__(args, log_path_suffix=logdir_)
 
-        wandb.init()
+        if eval_mode:
+            logdir_ = "eval_generation"
+        super().__init__(args, log_path_suffix=logdir_)
 
         assert args.style in ["iconography", "pixelart", "sketch"]
 
@@ -206,8 +232,7 @@ class VectorFusionPipeline(ModelState):
     @torch.no_grad()
     def rejection_sampling(
         self, img_caption: Union[AnyStr, List], diffusion_samples: List
-    ):
-        import clip  # local import
+    ):  # local import
 
         clip_model, preprocess = clip.load("ViT-B/32", device=self.device)
 
@@ -491,9 +516,12 @@ class VectorFusionPipeline(ModelState):
 
         return diffusion_samples
 
-    def LIVE_rendering(self, text_prompt: AnyStr, attribute: AnyStr | None = None):
+    def LIVE_rendering(self, text_prompt: AnyStr, attribute: AnyStr):
         select_fpth = self.select_fpth
         # sampling K images
+        k_sampling_timelog = TimeLogger(
+            "k_sampling_and_clip_rejction", self.args.use_wandb
+        )
         if self.args.reverse_diffusion_mode == "sampling":
             diffusion_samples = self.diffusion_sampling(text_prompt, attribute)
         else:
@@ -509,6 +537,10 @@ class VectorFusionPipeline(ModelState):
         )
         select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
         select_target_pil.save(select_fpth)
+
+        k_sampling_timelog.finish()
+
+        live_timelog = TimeLogger("live", self.args.use_wandb)
 
         # empty cache
         torch.cuda.empty_cache()
@@ -649,7 +681,15 @@ class VectorFusionPipeline(ModelState):
         final_svg_fpth = self.results_path / "live_stage_one_final.svg"
         renderer.save_svg(final_svg_fpth)
 
+        live_timelog.finish()
+
         return target_img, final_svg_fpth
+
+    def paint_for_evaluation(self, text_prompt, test_data_path, image_id):
+        self.test_data_path = test_data_path
+        self.image_id = image_id
+
+        self.painterly_rendering(text_prompt)
 
     def painterly_rendering(self, text_prompt: AnyStr, attribute: AnyStr | None = None):
         # log prompts
@@ -697,9 +737,13 @@ class VectorFusionPipeline(ModelState):
             target_img = target_img.detach()  # inputs as GT
             self.print("inputs shape: ", target_img.shape)
 
+        vetor_fusion_timelog = TimeLogger(
+            name="vector_fusion_part", use_wandb=self.args.use_wandb
+        )
         renderer = self.load_renderer(
             target_img, path_svg=self.args.path_svg, attention_map=attention_map
         )
+        target_img.to(self.device)
 
         if self.args.skip_live:
             init_type = "random"
@@ -824,6 +868,8 @@ class VectorFusionPipeline(ModelState):
                         return_per_layer=False,
                         normalize=False,
                     )
+                    target_img = target_img.to(self.device)
+                    raster_img = raster_img.to(self.device)
                     l_perceptual = perceptual_loss_fn(raster_img, target_img).mean()
                     l_percep = l_perceptual * self.args.perceptual.coeff
 
@@ -851,18 +897,16 @@ class VectorFusionPipeline(ModelState):
 
                 loss = L_sds + L_add + l_percep + total_visual_loss
 
-                # print(f"SDS Loss: {loss} at step {self.step}")
-                # wandb.log({"loss": loss})
-
-                wandb.log(
-                    {
-                        "L_total": loss.item(),
-                        "L_sds": L_sds.item(),
-                        "L_add": L_add.item(),
-                        "l_percep": l_percep.item(),
-                        "total_visual_loss": total_visual_loss.item(),
-                    }
-                )
+                if self.args.use_wandb:
+                    wandb.log(
+                        {
+                            "L_total": loss.item(),
+                            "L_sds": L_sds.item(),
+                            "L_add": L_add.item(),
+                            "l_percep": l_percep.item(),
+                            "total_visual_loss": total_visual_loss.item(),
+                        }
+                    )
 
                 # optimization
                 optimizer.zero_grad_()
@@ -913,14 +957,45 @@ class VectorFusionPipeline(ModelState):
                     )
                     image = Image.fromarray(image_array)
                     caption = f"step {self.step}"
-                    wandb.log({"image": wandb.Image(image, caption=caption)})
+                    if self.args.log_image and self.args.use_wandb:
+                        wandb.log({"image": wandb.Image(image, caption=caption)})
                     renderer.save_svg(self.ft_svg_logs_dir / f"svg_iter{self.step}.svg")
+                    # log clip score
+                    if self.args.log_clip:
+                        final_raster_img = renderer.get_image(self.step)
+                        clip_score = get_clip_score(
+                            text_prompt,
+                            ToPILImage()(final_raster_img.squeeze()),
+                            self.device,
+                        )
+                        print(clip_score)
+                        if self.args.use_wandb:
+                            wandb.log({"clip_score": clip_score})
 
                 self.step += 1
                 pbar.update(1)
 
         final_svg_fpth = self.results_path / "finetune_final.svg"
         renderer.save_svg(final_svg_fpth)
+
+        final_raster_img = renderer.get_image(self.step)
+        clip_score = get_clip_score(
+            text_prompt, ToPILImage()(final_raster_img.squeeze()), self.device
+        )
+        print(clip_score)
+        if self.args.use_wandb:
+            wandb.log({"clip_score": clip_score})
+        vetor_fusion_timelog.finish()
+
+        if self.eval_mode:
+            print("saving svg to testdataset")
+
+            final_svg_fpth = self.test_data_path / f"{self.image_id}.svg"
+            print(final_svg_fpth)
+            renderer.save_svg(final_svg_fpth)
+
+        # create gif of logs
+        create_gif_from_svgs(self.ft_svg_logs_dir, self.results_path)
 
         self.close(msg="painterly rendering complete.")
 
@@ -949,12 +1024,18 @@ class VectorFusionPipeline(ModelState):
     def extract_ldm_attn(self, prompts):
         print("\n\nextract_ldm_attn with k sampling\n\n")
         # init controller
-        controller = AttentionStore() if self.args.attention_init else EmptyControl()
+        controller = (
+            AttentionStore() if self.args.coord_init == "attention" else EmptyControl()
+        )
 
         cross_attention_outputs = []
         self_attention_comp_outputs = []
 
         select_fpth = self.select_fpth
+
+        k_sampling_timelog = TimeLogger(
+            "k_sampling_and_clip_rejction", use_wandb=self.args.use_wandb
+        )
 
         # sampling K images
         diffusion_samples = []
@@ -1017,9 +1098,10 @@ class VectorFusionPipeline(ModelState):
         select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
         select_target_pil.save(select_fpth)
 
-        # load target file
-        assert select_fpth.exists(), f"{select_fpth} is not exist!"
-        target_img = self.target_file_preprocess(select_fpth.as_posix())
+        k_sampling_timelog.finish()
+        attention_collect_timelog = TimeLogger(
+            "attention_collect", use_wandb=self.args.use_wandb
+        )
 
         target_path = self.results_path / "ldm_generated_image.png"
         view_images([np.array(select_target)], save_image=True, fp=target_path)
@@ -1089,6 +1171,7 @@ class VectorFusionPipeline(ModelState):
         # to [0, 1]
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
         self.print(f"-> fusion attn_map: {attn_map.shape}")
+        attention_collect_timelog.finish()
 
         return target_path, attn_map
 

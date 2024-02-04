@@ -104,8 +104,8 @@ class ModelState:
         """init visualized tracker"""
         log_with = []
         self.args.visual = False
-        if args.use_wandb:
-            log_with.append(LoggerType.WANDB)
+        # if args.use_wandb:
+        #     log_with.append(LoggerType.WANDB)
         if args.tensorboard:
             log_with.append(LoggerType.TENSORBOARD)
 
@@ -148,12 +148,12 @@ class ModelState:
             if self.accelerator.scaler_handler is not None and self.accelerator.scaler_handler.enabled:
                 print(f"-> Enabled GradScaler: {self.accelerator.scaler_handler.to_kwargs()}")
 
-            if args.use_wandb:
-                print(f"-> Init trackers: 'wandb' ")
-                self.args.visual = True
-                project_name = os.environ.get("WANDB_PROJECT")
-                print(f"Wandb project name: {project_name}")
-                self.__init_tracker(project_name=project_name, tags=None, entity="")
+            # if args.use_wandb:
+            #     print(f"-> Init trackers: 'wandb' ")
+            #     self.args.visual = True
+            #     project_name = os.environ.get("WANDB_PROJECT")
+            #     print(f"Wandb project name: {project_name}")
+            #     self.__init_tracker(project_name=project_name, tags=None, entity="")
 
             print(f"-> Working Space: '{self.results_path}'")
 

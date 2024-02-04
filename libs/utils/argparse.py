@@ -43,7 +43,9 @@ def accelerate_parser():
     parser.add_argument("-gard_norm", "--max_grad_norm", type=float, default=-1)
 
     # Trackers
-    parser.add_argument("--use-wandb", action="store_true")
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--log_clip", action="store_true")
+    parser.add_argument("--log_image", action="store_true")
     parser.add_argument("--project-name", type=str, default="SketchGeneration")
     parser.add_argument("--entity", type=str, default="ximinng")
     parser.add_argument("--tensorboard", action="store_true")
