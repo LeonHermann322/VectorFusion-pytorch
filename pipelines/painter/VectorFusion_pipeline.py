@@ -334,7 +334,11 @@ class VectorFusionPipeline(ModelState):
                         return_type="latents",
                     )
                     outputs = self.sample_diffusion_model(
-                        input=attribute, inference_steps=inf_steps_attr, latents=latents
+                        input=attribute,
+                        inference_steps=inf_steps_attr,
+                        latents=latents,
+                        return_type="pil",
+                        return_dict=True,
                     )
                 else:
                     # Encoding text input for diffusion model and CLIP loss
@@ -350,6 +354,20 @@ class VectorFusionPipeline(ModelState):
                     init_latents = self.latent_initialization(
                         prompt_emb_diffusion.dtype
                     )
+                    # Creation with only attribute
+                    outputs = self.sample_diffusion_model(
+                        input=attribute,
+                        inference_steps=self.args.num_inference_steps,
+                        latents=init_latents,
+                        return_type="pil",
+                        return_dict=True,
+                    )
+                    outputs_np = [np.array(img) for img in outputs.images]
+                    view_images(
+                        outputs_np,
+                        save_image=True,
+                        fp=self.sd_sample_dir / f"samples_{i}_attr.png",
+                    )
                     # Original creation without attribute
                     outputs = self.sample_diffusion_model(
                         input=text_prompt,
@@ -358,17 +376,16 @@ class VectorFusionPipeline(ModelState):
                         return_type="pil",
                         return_dict=True,
                     )
-
-                    # Encode sample of prompt with clip
-                    self.clip_score_fn = self.clip_score_fn.cuda()
-                    orig_img_pil = outputs.images[0]
-
                     outputs_np = [np.array(img) for img in outputs.images]
                     view_images(
                         outputs_np,
                         save_image=True,
-                        fp=self.sd_sample_dir / f"samples_{i}_no_attr.png",
+                        fp=self.sd_sample_dir / f"samples_{i}_orig.png",
                     )
+
+                    # Encode sample of prompt with clip
+                    self.clip_score_fn = self.clip_score_fn.cuda()
+                    orig_img_pil = outputs.images[0]
 
                     enc_orig_img = self.clip_score_fn.encode_image(
                         self.clip_score_fn.preprocess(
@@ -443,14 +460,26 @@ class VectorFusionPipeline(ModelState):
                         outputs_array.append(outputs)
 
                     min_loss_idx = np.argmin(losses)
+
+                    for lambda_idx, output in enumerate(outputs_array):
+                        file_path = (
+                            self.sd_sample_dir
+                            / f"samples_{i}_{(lambda_idx + 1) * self.args.lambda_step_size}.png"
+                        )
+                        outputs_np = [np.array(img) for img in output.images]
+                        view_images(outputs_np, save_image=True, fp=file_path)
+
                     file_path = (
                         self.sd_sample_dir
-                        / f"samples_{i}_{(min_loss_idx + 1) * self.args.lambda_step_size}.png"
+                        / f"samples_{i}_optim_{(min_loss_idx + 1) * self.args.lambda_step_size}.png"
                     )
                     outputs = outputs_array[min_loss_idx]
             else:
                 outputs = self.sample_diffusion_model(
-                    input=text_prompt, inference_steps=self.args.num_inference_steps
+                    input=text_prompt,
+                    inference_steps=self.args.num_inference_steps,
+                    return_type="pil",
+                    return_dict=True,
                 )
             outputs_np = [np.array(img) for img in outputs.images]
             view_images(outputs_np, save_image=True, fp=file_path)
@@ -470,7 +499,14 @@ class VectorFusionPipeline(ModelState):
         else:
             diffusion_samples = self.diffusion_sampling(text_prompt)
         # rejection sampling
-        select_target, _ = self.rejection_sampling(text_prompt, diffusion_samples)
+        select_target, _ = self.rejection_sampling(
+            (
+                text_prompt
+                if self.args.reverse_diffusion_mode == "finetuning"
+                else attribute
+            ),
+            diffusion_samples,
+        )
         select_target_pil = Image.fromarray(np.asarray(select_target))  # numpy to PIL
         select_target_pil.save(select_fpth)
 
@@ -707,9 +743,11 @@ class VectorFusionPipeline(ModelState):
                     if self.args.reverse_diffusion_embedding_mode == "interpolated":
                         # rev coeff 0.0 -> all prompt, 1.0 -> all attribute
                         rev_coeff = min(
-                            self.step / max_attribute_shift_step
-                            if max_attribute_shift_step > 0
-                            else 1.0,
+                            (
+                                self.step / max_attribute_shift_step
+                                if max_attribute_shift_step > 0
+                                else 1.0
+                            ),
                             1.0,
                         )
                         text_embedding = (
