@@ -529,9 +529,9 @@ class VectorFusionPipeline(ModelState):
         # rejection sampling
         select_target, _ = self.rejection_sampling(
             (
-                text_prompt
-                if self.args.reverse_diffusion_mode == "finetuning"
-                else attribute
+                attribute
+                if self.args.reverse_diffusion_mode == "sampling"
+                else text_prompt
             ),
             diffusion_samples,
         )
